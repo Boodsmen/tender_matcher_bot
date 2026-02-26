@@ -6,13 +6,30 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from config import settings
-from handlers import document, start
+from handlers import document, start, stats
 from middleware.auth import AuthMiddleware
 from utils.logger import logger
 
 
+def _run_migrations() -> None:
+    """Run Alembic database migrations on startup."""
+    try:
+        from alembic import command
+        from alembic.config import Config
+        alembic_cfg = Config("alembic.ini")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Database migrations applied successfully")
+    except Exception as e:
+        logger.error(f"Failed to run database migrations: {e}")
+        raise
+
+
 async def main() -> None:
     logger.info("Starting tender matcher bot...")
+
+    # Apply database migrations before starting the bot
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _run_migrations)
 
     bot = Bot(
         token=settings.bot_token,
@@ -26,6 +43,7 @@ async def main() -> None:
 
     # Register routers
     dp.include_router(start.router)
+    dp.include_router(stats.router)
     dp.include_router(document.router)
 
     logger.info("Bot started. Polling...")

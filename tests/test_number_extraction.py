@@ -20,7 +20,13 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from services.matcher import compare_spec_values, extract_number, extract_number_with_operator
+from services.matcher import (
+    compare_spec_values,
+    compare_values_eav,
+    extract_number,
+    extract_number_with_operator,
+    _apply_operator,
+)
 
 
 class TestSimpleNumbers:
@@ -49,7 +55,8 @@ class TestStringsWithUnits:
         assert extract_number("200 Вт") == 200.0
 
     def test_gigabytes(self):
-        assert extract_number("2 ГБ") == 2.0
+        # extract_number converts to MB base unit: 2 ГБ = 2*1024 = 2048 МБ
+        assert extract_number("2 ГБ") == 2048.0
 
     def test_temperature(self):
         assert extract_number("-40°C") == -40.0
@@ -62,10 +69,12 @@ class TestFractionalNumbers:
     """Тесты для дробных чисел."""
 
     def test_dot_separator(self):
-        assert extract_number("1.5 Гбит/с") == 1.5
+        # extract_number converts to Mbps base unit: 1.5 Гбит/с = 1.5*1000 = 1500 Мбит/с
+        assert extract_number("1.5 Гбит/с") == 1500.0
 
     def test_comma_separator(self):
-        assert extract_number("2,5 ГБ") == 2.5
+        # extract_number converts to MB base unit: 2.5 ГБ = 2.5*1024 = 2560 МБ
+        assert extract_number("2,5 ГБ") == 2560.0
 
     def test_multiple_dots(self):
         # Ожидаем первое число
@@ -296,6 +305,54 @@ class TestCompareSpecValues:
     def test_ge_operator(self):
         assert compare_spec_values(">=24", 24, "ports") is True
         assert compare_spec_values(">=24", 12, "ports") is False
+
+
+class TestBugFixes:
+    """Regression tests for confirmed bugs (see bug report)."""
+
+    # Bug 1: import_csv _extract_spec_value must store max of range as value_num.
+    # Tested here at the extract_number level (same logic, same regex).
+    def test_bug1_range_max_extracted(self):
+        # "10-20 Гбит/с" should yield 20, not 10
+        assert extract_number("10-20") == 20.0
+
+    def test_bug1_range_max_asymmetric(self):
+        # Unit multiplier is applied: 100 Гбит/с = 100_000 Мбит/с (base unit)
+        assert extract_number("5-100 Гбит/с") == 100_000.0
+
+    # Bug 2: compound DB value ">=32 и <=64" with single TZ requirement ">=50"
+    def test_bug2_compound_db_single_tz_pass(self):
+        # Device range [32..64], TZ requires >=50 → 64 >= 50 → True
+        assert compare_values_eav(">=50", ">=32 и <=64", 32) is True
+
+    def test_bug2_compound_db_single_tz_fail(self):
+        # Device range [32..40], TZ requires >=50 → 40 < 50 → False
+        assert compare_values_eav(">=50", ">=32 и <=40", 32) is False
+
+    def test_bug2_compound_db_le_tz(self):
+        # Device range [32..64], TZ requires <=35 → lower bound 32 <= 35 → True
+        assert compare_values_eav("<=35", ">=32 и <=64", 32) is True
+
+    def test_bug2_compound_db_le_tz_fail(self):
+        # Device range [40..64], TZ requires <=35 → lower bound 40 > 35 → False
+        assert compare_values_eav("<=35", ">=40 и <=64", 40) is False
+
+    # Bug 4: > and < operators must respect allow_lower tolerance
+    def test_bug4_gt_allow_lower_within_tolerance(self):
+        # model=30.5, req=32, op=">", allow_lower=True → 30.5 > 32*0.95=30.4 → True
+        assert _apply_operator(32, 30.5, ">", allow_lower=True) is True
+
+    def test_bug4_gt_no_allow_lower(self):
+        # Without allow_lower: 30.5 > 32 → False
+        assert _apply_operator(32, 30.5, ">", allow_lower=False) is False
+
+    def test_bug4_lt_allow_lower_within_tolerance(self):
+        # model=105, req=100, op="<", allow_lower=True → 105 < 100*1.05=105 → False (boundary)
+        assert _apply_operator(100, 104, "<", allow_lower=True) is True
+
+    def test_bug4_lt_no_allow_lower(self):
+        # Without allow_lower: 104 < 100 → False
+        assert _apply_operator(100, 104, "<", allow_lower=False) is False
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import case, func, select, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db import async_session_maker
-from database.models import Model, SearchHistory, User
+from database.models import Equipment, EquipmentSpec, SearchHistory, User
 from utils.logger import logger
 
 
@@ -24,7 +24,7 @@ async def create_user(
     telegram_id: int,
     username: Optional[str] = None,
     full_name: Optional[str] = None,
-    is_admin: bool = True,
+    is_admin: bool = False,
 ) -> User:
     async with async_session_maker() as session:
         async with session.begin():
@@ -40,33 +40,32 @@ async def create_user(
         return user
 
 
-# ──────────────────────────── Models ───────────────────────────
+# ──────────────────────────── Equipment ────────────────────────
 
 
-async def get_all_models() -> Sequence[Model]:
+async def get_all_equipment() -> Sequence[Equipment]:
     async with async_session_maker() as session:
-        result = await session.execute(select(Model))
+        result = await session.execute(select(Equipment))
         return result.scalars().all()
 
 
-async def get_models_by_category(category: str) -> Sequence[Model]:
+async def get_equipment_by_category(category: str) -> Sequence[Equipment]:
     async with async_session_maker() as session:
         result = await session.execute(
-            select(Model).where(Model.category.ilike(category))
+            select(Equipment).where(Equipment.category.ilike(category))
         )
         return result.scalars().all()
 
 
-async def get_model_by_name(model_name: str) -> Sequence[Model]:
-    """Search models by name. Exact matches come first, then substring matches."""
+async def get_equipment_by_name(model_name: str) -> Sequence[Equipment]:
+    """Search equipment by model name. Exact matches come first, then substring matches."""
     async with async_session_maker() as session:
         result = await session.execute(
-            select(Model)
-            .where(Model.model_name.ilike(f"%{model_name}%"))
+            select(Equipment)
+            .where(Equipment.model_name.ilike(f"%{model_name}%"))
             .order_by(
-                # Exact match (case-insensitive) first
                 case(
-                    (func.lower(Model.model_name) == model_name.lower(), 0),
+                    (func.lower(Equipment.model_name) == model_name.lower(), 0),
                     else_=1,
                 )
             )
@@ -74,48 +73,162 @@ async def get_model_by_name(model_name: str) -> Sequence[Model]:
         return result.scalars().all()
 
 
-async def get_models_count() -> int:
+async def get_equipment_count() -> int:
     async with async_session_maker() as session:
-        result = await session.execute(select(func.count(Model.id)))
+        result = await session.execute(select(func.count(Equipment.id)))
         return result.scalar_one()
 
 
-async def search_models_by_specs(
-    specifications: Dict[str, Any],
-    category: Optional[str] = None,
-    limit: int = 100,
-) -> Sequence[Model]:
-    """Search models whose specifications contain the given key-value pairs."""
+async def get_stats() -> Dict[str, int]:
+    """Return count of equipment grouped by category."""
     async with async_session_maker() as session:
-        query = select(Model)
-        if category:
-            query = query.where(Model.category == category)
-        # JSONB containment: model specs must contain all requested specs
-        query = query.where(Model.specifications.op("@>")(specifications))
-        query = query.limit(limit)
-        result = await session.execute(query)
-        return result.scalars().all()
+        result = await session.execute(
+            select(Equipment.category, func.count(Equipment.id))
+            .group_by(Equipment.category)
+            .order_by(Equipment.category)
+        )
+        return {row[0]: row[1] for row in result.all()}
 
 
-async def bulk_create_models(models_data: List[Dict[str, Any]]) -> int:
-    """Bulk insert models into the database. Returns number of inserted rows."""
-    if not models_data:
+async def bulk_create_equipment(items: List[Dict[str, Any]]) -> int:
+    """Bulk insert equipment into the database (without specs). Returns number of inserted rows."""
+    if not items:
         return 0
     async with async_session_maker() as session:
         async with session.begin():
-            session.add_all([Model(**data) for data in models_data])
-        logger.info(f"Bulk inserted {len(models_data)} models")
-        return len(models_data)
+            session.add_all([Equipment(**data) for data in items])
+        logger.info(f"Bulk inserted {len(items)} equipment records")
+        return len(items)
 
 
-async def delete_all_models() -> int:
-    """Delete all models from the database. Returns number of deleted rows."""
+async def bulk_create_equipment_with_specs(records: List[Dict[str, Any]]) -> int:
+    """
+    Insert equipment rows and their EAV specs in one transaction.
+
+    records: list of dicts:
+        {
+            "model_name": str,
+            "category": str,
+            "version": str | None,
+            "source_filename": str,
+            "specs": [(char_name, value_text, value_num, canonical_name), ...]
+        }
+
+    Returns number of inserted equipment rows.
+    """
+    if not records:
+        return 0
+
     async with async_session_maker() as session:
         async with session.begin():
-            result = await session.execute(text("DELETE FROM models"))
+            for record in records:
+                specs_data = record.get("specs", [])
+                eq_data = {k: v for k, v in record.items() if k != "specs"}
+                eq = Equipment(**eq_data)
+                session.add(eq)
+                await session.flush()  # populate eq.id
+
+                for spec_row in specs_data:
+                    # Support both 3-tuple (legacy) and 4-tuple (with canonical_name)
+                    if len(spec_row) == 4:
+                        char_name, value_text, value_num, canonical_name = spec_row
+                    else:
+                        char_name, value_text, value_num = spec_row
+                        canonical_name = None
+                    session.add(EquipmentSpec(
+                        equipment_id=eq.id,
+                        char_name=char_name,
+                        canonical_name=canonical_name,
+                        value_text=value_text,
+                        value_num=value_num,
+                    ))
+
+    logger.info(f"Bulk inserted {len(records)} equipment records with specs")
+    return len(records)
+
+
+async def get_specs_by_equipment_ids(
+    equipment_ids: List[int],
+) -> Dict[int, List[EquipmentSpec]]:
+    """
+    Return all EquipmentSpec rows for the given equipment IDs, grouped by equipment_id.
+
+    Returns:
+        Dict mapping equipment_id -> list of EquipmentSpec objects.
+    """
+    if not equipment_ids:
+        return {}
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(EquipmentSpec).where(
+                EquipmentSpec.equipment_id.in_(equipment_ids)
+            )
+        )
+        specs = result.scalars().all()
+
+    grouped: Dict[int, List[EquipmentSpec]] = defaultdict(list)
+    for spec in specs:
+        grouped[spec.equipment_id].append(spec)
+    return dict(grouped)
+
+
+async def find_matching_equipment_by_canonical(
+    category: str,
+    canonical_reqs: List[tuple],  # [(canonical_name, num_val, op), ...]
+) -> set:
+    """
+    SQL: найти equipment_id, удовлетворяющие числовым требованиям по canonical_name.
+
+    canonical_reqs: list of (canonical_name: str, num_val: float, op: str)
+    op: one of '>=', '<=', '>', '<', '='
+    Returns set of equipment_id.
+    """
+    # Map operator strings to SQLAlchemy column operator functions (no f-string SQL injection)
+    _OP_FUNCS = {
+        ">=": lambda col, val: col >= val,
+        "<=": lambda col, val: col <= val,
+        ">":  lambda col, val: col > val,
+        "<":  lambda col, val: col < val,
+        "=":  lambda col, val: col == val,
+    }
+    if not canonical_reqs:
+        return set()
+
+    async with async_session_maker() as session:
+        result_set: Optional[set] = None
+        for canonical_name, num_val, op in canonical_reqs:
+            op_func = _OP_FUNCS.get(op, _OP_FUNCS[">="])
+            rows = await session.execute(
+                select(EquipmentSpec.equipment_id.distinct())
+                .join(Equipment, Equipment.id == EquipmentSpec.equipment_id)
+                .where(
+                    Equipment.category.ilike(category),
+                    EquipmentSpec.canonical_name == canonical_name,
+                    op_func(EquipmentSpec.value_num, num_val),
+                )
+            )
+            ids = {r[0] for r in rows}
+            result_set = ids if result_set is None else result_set & ids
+        return result_set or set()
+
+
+async def delete_all_equipment() -> int:
+    """Delete all equipment from the database (specs deleted via CASCADE). Returns row count."""
+    async with async_session_maker() as session:
+        async with session.begin():
+            result = await session.execute(text("DELETE FROM equipment"))
             count = result.rowcount
-        logger.info(f"Deleted {count} models")
+        logger.info(f"Deleted {count} equipment records (specs deleted via CASCADE)")
         return count
+
+
+# ──────────────────────────── Backward compat aliases ──────────
+
+
+async def get_models_count() -> int:
+    """Backward-compat alias for get_equipment_count()."""
+    return await get_equipment_count()
 
 
 # ──────────────────────────── Search History ───────────────────

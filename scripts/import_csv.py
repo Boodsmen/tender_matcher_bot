@@ -1,9 +1,13 @@
 """
-Import all CSV files from data/csv/ into the models table with normalization.
+Import equipment data from XLSX / CSV files in data/csv/ into the equipment table.
 
-Prerequisites:
-  1. Database must be running and migrated (alembic upgrade head)
-  2. data/normalization_map.json must exist
+EAV schema: each characteristic is stored as a row in equipment_specs
+with char_name = original column name (no normalization).
+
+File naming convention:
+  Category_Switch_*.xlsx  →  category="Коммутаторы"
+  Category_Router_*.xlsx  →  category="Маршрутизаторы"
+  *.csv                   →  category determined by CATEGORY_MAPPING (filename prefix)
 
 Usage:
   python scripts/import_csv.py
@@ -14,7 +18,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -24,11 +28,35 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from utils.logger import logger
 
-CSV_DIR = os.path.join(PROJECT_ROOT, "data", "csv")
-NORMALIZATION_MAP_PATH = os.path.join(PROJECT_ROOT, "data", "normalization_map.json")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data", "csv")
+
+# ──────────────────────────── Canonical name mapping ───────────
+
+_NORMALIZATION_MAP_PATH = os.path.join(PROJECT_ROOT, "data", "normalization_map.json")
+
+def _build_reverse_map() -> Dict[str, str]:
+    """Build {russian_name_lower: canonical_key} from normalization_map.json."""
+    try:
+        with open(_NORMALIZATION_MAP_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        reverse: Dict[str, str] = {}
+        for canonical_key, synonyms in data.get("canonical_keys", {}).items():
+            for syn in synonyms:
+                reverse[syn.lower().strip()] = canonical_key
+        return reverse
+    except Exception as e:
+        logger.warning(f"Could not load normalization_map.json: {e}")
+        return {}
+
+_REVERSE_MAP: Dict[str, str] = _build_reverse_map()
+
+
+def _get_canonical_name(char_name: str) -> Optional[str]:
+    return _REVERSE_MAP.get(char_name.lower().strip())
 
 # ──────────────────────────── Category mapping ─────────────────
 
+# Fallback for CSV files without Category_ prefix
 CATEGORY_MAPPING = {
     "MES": "Коммутаторы",
     "ESR": "Маршрутизаторы",
@@ -37,8 +65,8 @@ CATEGORY_MAPPING = {
     "ME": "Коммутаторы",
     "ROS4": "Коммутаторы",
     "ROS6": "Коммутаторы",
-    "1805": "Маршрутизаторы",   # 1805_cleaned.csv contains ESR models
-    "T-TTv2": "Маршрутизаторы", # T-TTv2_cleaned.csv contains ESR models
+    "1805": "Маршрутизаторы",
+    "T-TTv2": "Маршрутизаторы",
 }
 
 # Column names that typically hold the model name
@@ -52,146 +80,117 @@ MODEL_NAME_CANDIDATES = [
     "Unnamed: 0",
 ]
 
-# Columns to skip when building specifications
+# Columns to skip when building specs
 SKIP_COLUMNS = {"model_name", "category", "Категория", "Тип коммутатора", "Тип устройства"}
 
+# EAV format column names (case-insensitive detection)
+_EAV_MODEL_COL = "модель"
+_EAV_CHAR_COL = "характеристика"
+_EAV_VAL_COL = "значение"
 
-# ──────────────────────────── Normalization helpers ─────────────
-
-
-def load_normalization_map() -> Dict:
-    if not os.path.exists(NORMALIZATION_MAP_PATH):
-        logger.warning(
-            f"normalization_map.json not found at {NORMALIZATION_MAP_PATH}. "
-            "Import will use raw column names."
-        )
-        return {"canonical_keys": {}}
-    with open(NORMALIZATION_MAP_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+# Null-like values to skip
+_NULL_VALUES = {"", "-", "—", "н/д", "n/a", "nan", "none", "нет данных"}
 
 
-def normalize_column_name(column: str, normalization_map: Dict) -> str:
-    """Map a CSV column name to its canonical key.
+# ──────────────────────────── Value extraction ──────────────────
 
-    Strips pandas duplicate-column suffixes (.1, .2, ...) before lookup,
-    so that duplicate columns from Excel (same characteristic in two standards)
-    are correctly mapped instead of silently dropped.
-    Case-insensitive lookup to be consistent with table_parser.py.
+
+def _extract_spec_value(value: Any) -> Tuple[Optional[str], Optional[float]]:
     """
-    # Strip pandas auto-added duplicate suffixes: "Поле.1" → "Поле"
-    clean_col = re.sub(r'\.\d+$', '', column.strip())
-    clean_col_lower = clean_col.lower()
-    for canonical_key, synonyms in normalization_map.get("canonical_keys", {}).items():
-        if any(clean_col_lower == s.lower() for s in synonyms):
-            return canonical_key
-    return clean_col
+    Extract (value_text, value_num) from a raw cell value.
 
+    Returns:
+        (value_text, value_num) — both may be None if value is empty/null.
+        value_text is always a non-empty string if not None.
+        value_num is float or None.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, float) and pd.isna(value):
+        return None, None
+    if isinstance(value, bool):
+        value_text = "Да" if value else "Нет"
+        return value_text, None
 
-# Numeric specification keys
-NUMERIC_KEYS = {
-    "ports_1g_sfp", "ports_10g_sfp", "ports_1000base_t",
-    "ports_100base_t", "ports_25g_sfp", "ports_40g_qsfp",
-    "ports_100g_qsfp", "ports_combo", "ports_poe",
-    "ram_gb", "flash_mb", "packet_buffer_mb",
-    "mac_table_size", "vlan_count", "max_routes",
-    "mtbf_hours", "weight_kg",
-}
-
-# Boolean specification keys
-BOOLEAN_KEYS = {
-    "ipv6_support", "poe_support", "vlan_support",
-    "snmp_support", "ssh_support", "redundancy_support",
-    "stacking_support", "mpls_support", "bgp_support",
-    "ospf_support", "igmp_support", "qos_support",
-    "acl_support", "sflow_support", "netflow_support",
-}
-
-COMPLEX_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
-    r'\bпо\b',          # "4 блока по 8 портов"
-    r'(?<!\d)[хx](?!\d)',  # кириллическое/латинское "x" не между цифрами (НЕ "2x4")
-    r'[+*/]',           # арифметика (кроме минуса — он может быть в диапазонах)
-]]
-
-
-def clean_spec_value(key: str, value: Any) -> Optional[Any]:
-    """Clean and normalize a specification value."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
     value_str = str(value).strip()
-    if value_str in ("", "-", "—", "н/д", "N/A", "n/a"):
-        return None
+    if value_str.lower() in _NULL_VALUES:
+        return None, None
 
-    # Numeric keys
-    if key in NUMERIC_KEYS:
-        # Detect complex expressions
-        if any(p.search(value_str) for p in COMPLEX_PATTERNS):
-            logger.warning(f"Complex value for {key}: {value_str} — skipping")
-            return None
-        digits = re.findall(r'\d+\.?\d*', value_str)
-        if digits:
-            return int(float(digits[0]))
-        return None
+    # Extract numeric value
+    value_num: Optional[float] = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value_num = float(value)
+    else:
+        # Sum: "24+4" → 28
+        sum_match = re.match(r'^(\d+)\s*\+\s*(\d+)$', value_str.strip())
+        if sum_match:
+            value_num = float(int(sum_match.group(1)) + int(sum_match.group(2)))
+        else:
+            # Product: "24x4" / "24х4"
+            mult_match = re.match(r'^(\d+)\s*[xхX×]\s*(\d+)$', value_str.strip())
+            if mult_match:
+                value_num = float(int(mult_match.group(1)) * int(mult_match.group(2)))
+            else:
+                # Range: "10-20" → use max (e.g. "10-20 Гбит/с" → 20)
+                range_match = re.search(r'(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)', value_str)
+                if range_match:
+                    value_num = max(float(range_match.group(1)), float(range_match.group(2)))
+                else:
+                    # First number in string
+                    digits = re.findall(r'-?\d+\.?\d*', value_str)
+                    if digits:
+                        try:
+                            value_num = float(digits[0])
+                        except ValueError:
+                            pass
 
-    # Power (watts)
-    if key == "power_watt":
-        match = re.search(r'(\d+\.?\d*)\s*(?:Вт|W|вт|w)', value_str, re.IGNORECASE)
-        if match:
-            return int(float(match.group(1)))
-        digits = re.findall(r'\d+\.?\d*', value_str)
-        if digits:
-            return int(float(digits[0]))
-        return None
-
-    # Boolean keys
-    if key in BOOLEAN_KEYS:
-        val_lower = value_str.lower()
-        # Check negative FIRST — "не поддерживается" contains "поддерживается"
-        negative = ("нет", "no", "false", "не поддерживается", "отсутствует")
-        positive = ("да", "yes", "true", "поддерживается", "есть", "имеется")
-        if any(n in val_lower for n in negative):
-            return False
-        if val_lower == "+":
-            return True
-        if val_lower == "-":
-            return False
-        if any(p in val_lower for p in positive):
-            return True
-        return None
-
-    # Text — trim whitespace
-    return value_str
+    return value_str, value_num
 
 
-# ──────────────────────────── Source / category extraction ──────
+# ──────────────────────────── Category / Version from filename ──
 
 
-def extract_source_from_filename(filename: str) -> str:
-    """Extract a short source identifier from the CSV filename."""
+def extract_category_from_filename(filename: str) -> Optional[str]:
+    """Determine category from Category_Switch / Category_Router prefix."""
     name = os.path.splitext(filename)[0]
-    # Remove common suffixes
-    for suffix in ("_cleaned", "_Лист1", "_Лист2"):
-        name = name.replace(suffix, "")
-    return name
-
-
-def extract_category(source_file: str, row_data: Dict) -> Optional[str]:
-    """Determine equipment category from row data or filename."""
-    # Check if the row has a category column
-    _INVALID_VALUES = {"", "-", "—", "nan", "n/a", "н/д"}
-    for col in ("Тип коммутатора", "Тип устройства", "Категория"):
-        val = row_data.get(col)
-        if val is None:
-            continue
-        if isinstance(val, float) and pd.isna(val):
-            continue
-        val_str = str(val).strip()
-        if val_str and val_str.lower() not in _INVALID_VALUES:
-            return val_str
-    # Fallback to filename-based mapping
+    if "Category_Switch" in name:
+        return "Коммутаторы"
+    if "Category_Router" in name:
+        return "Маршрутизаторы"
+    # Fallback: model prefix mapping
     for prefix, cat in CATEGORY_MAPPING.items():
-        if prefix.lower() in source_file.lower():
+        if prefix.lower() in name.lower():
             return cat
     return None
+
+
+def parse_version_from_filename(filename: str) -> Optional[str]:
+    """Extract version string from filename."""
+    name = os.path.splitext(filename)[0]
+
+    if re.search(r'final', name, re.IGNORECASE):
+        m = re.search(r'[_\s]v\.?(\d+)[.,](\d+)', name, re.IGNORECASE)
+        if m:
+            return f"finalUPD v{m.group(1)}.{m.group(2)}"
+        m = re.search(r'[_\s]v\.?(\d+)', name, re.IGNORECASE)
+        if m:
+            return f"finalUPD v{m.group(1)}"
+        return "finalUPD"
+
+    m = re.search(r'_v(\d+)(?:[.,](\d+))?(?!\d)', name, re.IGNORECASE)
+    if m:
+        if m.group(2):
+            return f"v{m.group(1)}.{m.group(2)}"
+        return f"v{m.group(1)}"
+
+    m = re.search(r'(\d{2}[.,]\d{2}(?:[.,]\d{4})?)', name)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+# ──────────────────────────── Model name column detection ───────
 
 
 def detect_model_name_column(columns: List[str]) -> Optional[str]:
@@ -200,124 +199,221 @@ def detect_model_name_column(columns: List[str]) -> Optional[str]:
     for candidate in MODEL_NAME_CANDIDATES:
         if candidate.lower() in cols_lower:
             return cols_lower[candidate.lower()]
-    # Heuristic: first column
     return columns[0] if columns else None
 
 
-# ──────────────────────────── Import logic ─────────────────────
+# ──────────────────────────── File parsers ─────────────────────
 
 
-def parse_csv_file(
-    filepath: str,
-    filename: str,
-    normalization_map: Dict,
-) -> List[Dict[str, Any]]:
-    """Parse a single CSV file and return a list of model dicts ready for DB insert."""
+def _load_dataframe(filepath: str, filename: str) -> Optional[pd.DataFrame]:
+    """Load a CSV or XLSX file into a DataFrame."""
+    ext = os.path.splitext(filename)[1].lower()
     try:
-        df = pd.read_csv(filepath, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(filepath, encoding="cp1251")
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(filepath, engine="openpyxl")
+        else:
+            try:
+                df = pd.read_csv(filepath, encoding="utf-8")
+            except UnicodeDecodeError:
+                df = pd.read_csv(filepath, encoding="cp1251")
+    except Exception as e:
+        logger.error(f"Failed to read {filename}: {e}")
+        return None
 
     if df.empty:
-        logger.warning(f"Empty CSV: {filename}")
-        return []
+        logger.warning(f"Empty file: {filename}")
+        return None
 
-    # Strip column whitespace
     df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-    model_col = detect_model_name_column(list(df.columns))
-    if model_col is None:
-        logger.error(f"Cannot detect model_name column in {filename}")
-        return []
 
-    source_file = extract_source_from_filename(filename)
-    models: List[Dict[str, Any]] = []
+def _is_eav_format(df: pd.DataFrame) -> bool:
+    """Return True if the DataFrame has EAV columns: Модель, Характеристика, Значение."""
+    cols_lower = {c.lower() for c in df.columns}
+    return {_EAV_MODEL_COL, _EAV_CHAR_COL, _EAV_VAL_COL}.issubset(cols_lower)
+
+
+def _parse_eav(
+    df: pd.DataFrame,
+    filename: str,
+    category: str,
+    version: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Parse EAV format: rows are (Модель, Характеристика, Значение) triples."""
+    col_map = {c.lower(): c for c in df.columns}
+    model_col = col_map[_EAV_MODEL_COL]
+    char_col = col_map[_EAV_CHAR_COL]
+    val_col = col_map[_EAV_VAL_COL]
+
+    # Group rows by model name
+    model_specs: Dict[str, List[Tuple[str, Optional[str], Optional[float], Optional[str]]]] = {}
+    seen_chars: Dict[str, set] = {}  # model_name -> set of char_names (dedup)
 
     for _, row in df.iterrows():
         model_name = row.get(model_col)
         if model_name is None or (isinstance(model_name, float) and pd.isna(model_name)):
             continue
         model_name = str(model_name).strip()
-        if not model_name:
+        if not model_name or model_name.lower() in ("nan", "none", ""):
             continue
 
-        specifications: Dict[str, Any] = {}
-        raw_specifications: Dict[str, str] = {}
+        char_name = row.get(char_col)
+        if char_name is None or (isinstance(char_name, float) and pd.isna(char_name)):
+            continue
+        char_name = str(char_name).strip()
+        if not char_name:
+            continue
+
+        value_text, value_num = _extract_spec_value(row.get(val_col))
+        if value_text is None:
+            continue
+
+        if model_name not in model_specs:
+            model_specs[model_name] = []
+            seen_chars[model_name] = set()
+
+        # Keep first non-None value for duplicate characteristics
+        if char_name not in seen_chars[model_name]:
+            seen_chars[model_name].add(char_name)
+            canonical = _get_canonical_name(char_name)
+            model_specs[model_name].append((char_name, value_text, value_num, canonical))
+
+    records = []
+    for model_name, specs in model_specs.items():
+        if not specs:
+            continue
+        records.append({
+            "model_name": model_name,
+            "category": category,
+            "version": version,
+            "source_filename": filename,
+            "specs": specs,
+        })
+    return records
+
+
+def parse_file(
+    filepath: str,
+    filename: str,
+) -> List[Dict[str, Any]]:
+    """Parse a single file and return a list of equipment dicts ready for DB insert."""
+    df = _load_dataframe(filepath, filename)
+    if df is None:
+        return []
+
+    category = extract_category_from_filename(filename)
+    if not category:
+        logger.warning(f"Cannot determine category for {filename} — skipping")
+        return []
+
+    version = parse_version_from_filename(filename)
+
+    # EAV format: Модель | Характеристика | Значение
+    if _is_eav_format(df):
+        return _parse_eav(df, filename, category, version)
+
+    # Wide format: each row = one model, columns = characteristics
+    model_col = detect_model_name_column(list(df.columns))
+    if model_col is None:
+        logger.error(f"Cannot detect model_name column in {filename}")
+        return []
+
+    records: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        model_name = row.get(model_col)
+        if model_name is None or (isinstance(model_name, float) and pd.isna(model_name)):
+            continue
+        model_name = str(model_name).strip()
+        if not model_name or model_name.lower() in ("nan", "none", ""):
+            continue
+
+        specs: List[Tuple[str, Optional[str], Optional[float], Optional[str]]] = []
+        seen_chars: set = set()
         row_dict = row.to_dict()
 
         for column, value in row_dict.items():
             if column == model_col or column in SKIP_COLUMNS:
                 continue
-            # Save raw value (use original column name)
-            if value is not None and not (isinstance(value, float) and pd.isna(value)):
-                raw_specifications[column] = str(value)
+            # Use original column name (no normalization)
+            char_name = column
+            value_text, value_num = _extract_spec_value(value)
+            if value_text is not None and char_name not in seen_chars:
+                seen_chars.add(char_name)
+                canonical = _get_canonical_name(char_name)
+                specs.append((char_name, value_text, value_num, canonical))
 
-            canonical_key = normalize_column_name(column, normalization_map)
-            clean_value = clean_spec_value(canonical_key, value)
-            if clean_value is not None:
-                # For duplicate columns (.1/.2 suffixes) keep first non-None value
-                if canonical_key not in specifications:
-                    specifications[canonical_key] = clean_value
+        if not specs:
+            continue
 
-        category = extract_category(source_file, row_dict)
-
-        models.append({
+        records.append({
             "model_name": model_name,
             "category": category,
-            "source_file": source_file,
-            "specifications": specifications,
-            "raw_specifications": raw_specifications,
+            "version": version,
+            "source_filename": filename,
+            "specs": specs,
         })
 
-    return models
+    return records
 
 
-async def import_all_csv():
-    """Import all CSV files from data/csv/ into the database."""
-    from database.crud import bulk_create_models, delete_all_models, get_models_count
+# ──────────────────────────── Main import logic ─────────────────
 
-    normalization_map = load_normalization_map()
-    logger.info(
-        f"Loaded normalization map with "
-        f"{len(normalization_map.get('canonical_keys', {}))} canonical keys"
+
+async def import_all_files():
+    """Import all XLSX/CSV files from data/csv/ into the equipment table."""
+    from database.crud import (
+        bulk_create_equipment_with_specs,
+        delete_all_equipment,
+        get_equipment_count,
     )
 
-    csv_files = sorted(
-        f for f in os.listdir(CSV_DIR) if f.lower().endswith(".csv")
+    # Collect supported files
+    all_files = sorted(
+        f for f in os.listdir(DATA_DIR)
+        if f.lower().endswith((".xlsx", ".xls", ".csv"))
     )
-    if not csv_files:
-        logger.error(f"No CSV files found in {CSV_DIR}")
+    if not all_files:
+        logger.error(f"No supported files found in {DATA_DIR}")
         return
 
-    # Clear existing models
-    deleted = await delete_all_models()
+    logger.info(f"Found {len(all_files)} files to import")
+
+    # Clear existing equipment (specs deleted via CASCADE)
+    deleted = await delete_all_equipment()
     if deleted:
-        logger.info(f"Cleared {deleted} existing models")
+        logger.info(f"Cleared {deleted} existing equipment records")
 
     total_imported = 0
-    for i, filename in enumerate(csv_files, 1):
-        filepath = os.path.join(CSV_DIR, filename)
-        try:
-            models_data = parse_csv_file(filepath, filename, normalization_map)
-            if models_data:
-                count = await bulk_create_models(models_data)
-                total_imported += count
-                logger.info(f"[{i}/{len(csv_files)}] {filename}: {count} models imported")
-            else:
-                logger.warning(f"[{i}/{len(csv_files)}] {filename}: no models found")
-        except Exception as e:
-            logger.error(f"[{i}/{len(csv_files)}] {filename}: ERROR — {e}")
+    skipped = 0
 
-    total_in_db = await get_models_count()
+    for i, filename in enumerate(all_files, 1):
+        filepath = os.path.join(DATA_DIR, filename)
+        try:
+            records = parse_file(filepath, filename)
+            if records:
+                count = await bulk_create_equipment_with_specs(records)
+                total_imported += count
+                logger.info(f"[{i}/{len(all_files)}] {filename}: {count} records imported")
+            else:
+                skipped += 1
+                logger.warning(f"[{i}/{len(all_files)}] {filename}: no records found or skipped")
+        except Exception as e:
+            logger.error(f"[{i}/{len(all_files)}] {filename}: ERROR — {e}", exc_info=True)
+            skipped += 1
+
+    total_in_db = await get_equipment_count()
     logger.info(
-        f"\nImport complete: {total_imported} models imported from "
-        f"{len(csv_files)} files. Total in DB: {total_in_db}"
+        f"\nImport complete: {total_imported} records imported from "
+        f"{len(all_files) - skipped} files ({skipped} skipped). "
+        f"Total in DB: {total_in_db}"
     )
 
 
 def main():
-    print("Starting CSV import...")
-    asyncio.run(import_all_csv())
+    print("Starting equipment import...")
+    asyncio.run(import_all_files())
 
 
 if __name__ == "__main__":

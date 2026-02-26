@@ -4,6 +4,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     Index,
     Integer,
     String,
@@ -25,33 +26,48 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )
 
 
-class Model(Base):
-    __tablename__ = "models"
+class Equipment(Base):
+    """Модель оборудования — одна запись = одна версия одной модели из одного файла."""
+
+    __tablename__ = "equipment"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    category: Mapped[str] = mapped_column(String(255), nullable=False)
     model_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    category: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    source_file: Mapped[str] = mapped_column(String(100), nullable=False)
-    specifications: Mapped[dict] = mapped_column(JSONB, nullable=False, default={})
-    raw_specifications: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    source_filename: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
     )
 
     __table_args__ = (
-        Index("idx_model_name", "model_name"),
-        Index("idx_category", "category"),
-        Index("idx_source_file", "source_file"),
-        Index("idx_specifications_gin", "specifications", postgresql_using="gin"),
+        Index("idx_equipment_category", "category"),
+        Index("idx_equipment_model_name", "model_name"),
+    )
+
+
+class EquipmentSpec(Base):
+    """EAV: одна строка = одна характеристика одной модели (оригинальное название из XLSX)."""
+
+    __tablename__ = "equipment_specs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    equipment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("equipment.id", ondelete="CASCADE"), nullable=False
+    )
+    char_name: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_name: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    value_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    value_num: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("idx_equipment_specs_equipment_id", "equipment_id"),
     )
 
 

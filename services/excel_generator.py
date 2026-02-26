@@ -1,11 +1,11 @@
 """
-Модуль для генерации Excel отчетов с результатами сопоставления моделей.
+Генерация Excel отчётов с результатами сопоставления моделей.
 
-Структура отчета (по образцу matching_result_tz_uq91nirt):
-- Лист "Сводка"           — метаданные + статистика + топ-10
-- Лист "Все совпадения"   — все модели ≥ min_percentage (sorted)
-- Лист "Детали совпадений"— построчное сравнение характеристик
-- Лист "Не сопоставленные"— позиции без подходящих моделей
+Структура отчёта:
+- Лист "Сводка"         — плашка предупреждения + метаданные +
+                          по одной таблице на каждую позицию ТЗ (рядом или стопкой)
+- Листы "Поз. N ..."    — один лист на каждую позицию ТЗ:
+                          таблица «Характеристика | Требуется | Факт. (модель 1) | ...»
 """
 
 import json
@@ -13,7 +13,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
@@ -21,17 +21,24 @@ from openpyxl.utils import get_column_letter
 
 from utils.logger import logger
 
-# ─── Цвета ───────────────────────────────────────────────────────────────────
-COLOR_GREEN      = "C6EFCE"   # ✅ Совпадает
-COLOR_YELLOW     = "FFEB9C"   # ⚠️ Частичное / старые версии
-COLOR_RED        = "FFC7CE"   # ❌ Не совпадает
-COLOR_ORANGE     = "FFD699"   # ? Нет в каталоге
-COLOR_GRAY       = "D9D9D9"   # Заголовок
-COLOR_LIGHT_GRAY = "F2F2F2"   # Нечётные строки
-COLOR_BLUE_HDR   = "BDD7EE"   # Заголовок секции модели
-COLOR_DARK       = "404040"   # Тёмный шрифт
+# ─── Пороги цветовой схемы ────────────────────────────────────────────────────
+THRESHOLD_GREEN  = 85.0   # ≥ 85% → зелёный
+THRESHOLD_YELLOW = 70.0   # 70–84% → жёлтый
+THRESHOLD_ORANGE = 50.0   # 50–69% → оранжевый
+THRESHOLD_MIN    = 50.0   # < 50% → не показываем вообще
 
-# ─── Reverse mapping (canonical_key → читаемое название) ─────────────────────
+# ─── Цвета ───────────────────────────────────────────────────────────────────
+COLOR_GREEN       = "C6EFCE"
+COLOR_YELLOW      = "FFEB9C"
+COLOR_ORANGE      = "FFD699"
+COLOR_RED         = "FFC7CE"
+COLOR_GRAY        = "D9D9D9"
+COLOR_LIGHT_GRAY  = "F2F2F2"
+COLOR_BLUE_HDR    = "BDD7EE"
+COLOR_WARN_BG     = "FF0000"   # фон плашки предупреждения
+COLOR_WARN_TEXT   = "FFFFFF"
+
+# ─── Reverse mapping ─────────────────────────────────────────────────────────
 _REVERSE_MAPPING_CACHE: Optional[Dict[str, str]] = None
 
 
@@ -43,7 +50,6 @@ def _load_reverse_mapping() -> Dict[str, str]:
         path = Path(__file__).parent.parent / "data" / "reverse_normalization_map.json"
         with open(path, "r", encoding="utf-8") as f:
             _REVERSE_MAPPING_CACHE = json.load(f)
-        logger.debug(f"Loaded reverse mapping: {len(_REVERSE_MAPPING_CACHE)} keys")
     except Exception as e:
         logger.warning(f"Failed to load reverse_normalization_map.json: {e}")
         _REVERSE_MAPPING_CACHE = {}
@@ -75,6 +81,18 @@ def _parse_version(source_file: str) -> str:
     return source_file
 
 
+# ─── Цвет по проценту ────────────────────────────────────────────────────────
+
+def _pct_color(pct: float) -> str:
+    if pct >= THRESHOLD_GREEN:
+        return COLOR_GREEN
+    if pct >= THRESHOLD_YELLOW:
+        return COLOR_YELLOW
+    if pct >= THRESHOLD_ORANGE:
+        return COLOR_ORANGE
+    return COLOR_RED
+
+
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
 
 def _fill(color: str) -> PatternFill:
@@ -88,12 +106,17 @@ def _bold(size: int = 11, color: str = None) -> Font:
     return Font(**kwargs)
 
 
-def _center() -> Alignment:
-    return Alignment(horizontal="center", vertical="center", wrap_text=True)
+def _center(wrap: bool = True) -> Alignment:
+    return Alignment(horizontal="center", vertical="center", wrap_text=wrap)
 
 
-def _left() -> Alignment:
-    return Alignment(horizontal="left", vertical="center", wrap_text=True)
+def _left(wrap: bool = True) -> Alignment:
+    return Alignment(horizontal="left", vertical="center", wrap_text=wrap)
+
+
+def _thin_border() -> Border:
+    s = Side(style="thin", color="AAAAAA")
+    return Border(left=s, right=s, top=s, bottom=s)
 
 
 def _auto_width(ws, min_w: int = 8, max_w: int = 60) -> None:
@@ -109,404 +132,570 @@ def _auto_width(ws, min_w: int = 8, max_w: int = 60) -> None:
         ws.column_dimensions[col_letter].width = min(max(best + 2, min_w), max_w)
 
 
-def _header_row(ws, row: int, n_cols: int, bg: str = COLOR_GRAY) -> None:
-    for c in range(1, n_cols + 1):
-        cell = ws.cell(row=row, column=c)
-        cell.font = _bold()
-        cell.fill = _fill(bg)
-        cell.alignment = _center()
+def _set_row(ws, row: int, values: list, fills=None, fonts=None, aligns=None,
+             height: int = None, border: bool = False) -> None:
+    """Write a row and optionally apply styles."""
+    for ci, v in enumerate(values, 1):
+        cell = ws.cell(row=row, column=ci, value=v)
+        if fills and ci - 1 < len(fills) and fills[ci - 1]:
+            cell.fill = _fill(fills[ci - 1])
+        if fonts and ci - 1 < len(fonts) and fonts[ci - 1]:
+            cell.font = fonts[ci - 1]
+        if aligns and ci - 1 < len(aligns) and aligns[ci - 1]:
+            cell.alignment = aligns[ci - 1]
+        if border:
+            cell.border = _thin_border()
+    if height:
+        ws.row_dimensions[row].height = height
+
+
+def _merge_row(ws, row: int, start_col: int, end_col: int, value,
+               fill_color: str = None, font=None, align=None, height: int = None) -> None:
+    ws.merge_cells(start_row=row, start_column=start_col,
+                   end_row=row, end_column=end_col)
+    cell = ws.cell(row=row, column=start_col, value=value)
+    if fill_color:
+        cell.fill = _fill(fill_color)
+    if font:
+        cell.font = font
+    if align:
+        cell.alignment = align
+    if height:
+        ws.row_dimensions[row].height = height
 
 
 def _comparison_detail(req_val: Any, mod_val: Any) -> str:
-    """Generate a short comparison description like '54.0 >= 32.0'."""
     try:
         from services.matcher import extract_number, extract_number_with_operator
         req_num, op = extract_number_with_operator(req_val)
         mod_num = extract_number(mod_val)
         if req_num is not None and mod_num is not None:
-            op_display = op if op != ">=" else ">="
-            return f"{mod_num} {op_display} {req_num}"
+            return f"{mod_num} {op} {req_num}"
     except Exception:
         pass
-    if isinstance(req_val, str) and isinstance(mod_val, str):
-        r, m = req_val.strip().lower(), mod_val.strip().lower()
-        if r == m:
-            return "Exact text match"
-        if r in m:
-            return f"'{req_val}' found in '{mod_val}'"
     return ""
 
 
-# ─── Лист 1: Сводка ──────────────────────────────────────────────────────────
+# ─── Лист "Сводка" ────────────────────────────────────────────────────────────
 
 def _create_summary_sheet(
     wb: Workbook,
     match_results: Dict[str, Any],
     filename: str,
     processing_time: float,
-    threshold: int,
-    min_percentage: float,
 ) -> None:
     ws = wb.active
     ws.title = "Сводка"
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 22
+    ws.sheet_properties.tabColor = "2E75B6"
+    ws.column_dimensions["A"].width = 2   # узкий отступ
 
-    def kv(label: str, value: Any, bold_val: bool = False) -> None:
-        r = ws.max_row + 1
-        ws.cell(row=r, column=1, value=label).font = _bold()
-        cell = ws.cell(row=r, column=2, value=value)
-        if bold_val:
-            cell.font = _bold()
+    _nw_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    _nw_left   = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
 
-    # ── Заголовок ──
-    ws.append(["Результаты сопоставления оборудования"])
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
-    ws.cell(row=1, column=1).font = Font(bold=True, size=14)
-    ws.cell(row=1, column=1).alignment = _center()
-    ws.cell(row=1, column=1).fill = _fill(COLOR_GRAY)
-    ws.row_dimensions[1].height = 28
-
-    ws.append([])  # empty row
-
-    # ── Метаданные ──
-    kv("Файл ТЗ:", filename)
-    kv("Дата обработки:", datetime.now().strftime("%d.%m.%Y %H:%M"))
-    if processing_time:
-        kv("Время обработки:", f"{processing_time:.2f} сек")
-
-    ws.append([])
-
-    # ── Статистика ──
     results = match_results.get("results", [])
-    total_reqs = sum(
-        len(r["requirement"].get("required_specs", {}))
+    n_items = len(results)
+
+    # ── Строка 1: заголовок отчёта ────────────────────────────────────────────
+    n_cols = 10
+    _merge_row(ws, 1, 1, n_cols,
+               "Отчёт по подбору оборудования",
+               fill_color="2E75B6",
+               font=Font(bold=True, size=16, color="FFFFFF"),
+               align=_nw_center, height=36)
+
+    # ── Строка 2: предупреждение ──────────────────────────────────────────────
+    _merge_row(ws, 2, 1, n_cols,
+               "Программа может допускать ошибки — проверьте модели по исходным таблицам каталога",
+               fill_color="FF8C00",
+               font=Font(bold=True, size=10, color="FFFFFF"),
+               align=_nw_center, height=22)
+
+    # ── Строка 3: разделитель ─────────────────────────────────────────────────
+    ws.row_dimensions[3].height = 6
+
+    # ── Метаданные ────────────────────────────────────────────────────────────
+    total_specs_all = sum(
+        len(_effective_specs(r.get("requirement", {}).get("required_specs", {})))
         for r in results
     )
-    # Collect all matches ≥ min_percentage across all requirements
-    all_filtered = []
-    for result in results:
-        for cat in ("ideal", "partial", "not_matched"):
-            for m in result["matches"].get(cat, []):
-                if m["match_percentage"] >= min_percentage:
-                    all_filtered.append(m)
+    meta_row = 4
+    meta_items = [
+        ("Файл ТЗ", filename),
+        ("Дата", datetime.now().strftime("%d.%m.%Y  %H:%M")),
+        ("Время обработки", f"{processing_time:.1f} сек" if processing_time else "—"),
+        ("Позиций", str(n_items)),
+        ("Характеристик", str(total_specs_all)),
+        ("Порог", f"≥ {THRESHOLD_MIN:.0f}%"),
+    ]
+    for label, value in meta_items:
+        lc = ws.cell(row=meta_row, column=2, value=label)
+        lc.font = Font(size=10, color="666666")
+        lc.alignment = Alignment(horizontal="right", vertical="center")
+        vc = ws.cell(row=meta_row, column=3, value=value)
+        vc.font = Font(size=10, bold=True)
+        vc.alignment = _nw_left
+        ws.merge_cells(start_row=meta_row, start_column=3,
+                       end_row=meta_row, end_column=5)
+        ws.row_dimensions[meta_row].height = 18
+        meta_row += 1
 
-    kv("Статистика требований:", None)
-    r = ws.max_row
-    ws.cell(row=r, column=2).value = None
+    # ── Предупреждение о позициях без категории ───────────────────────────────
+    no_category_items = [
+        r["requirement"].get("item_name") or r["requirement"].get("model_name") or f"Позиция {i+1}"
+        for i, r in enumerate(results)
+        if r.get("category_not_detected")
+    ]
+    if no_category_items:
+        names_str = ", ".join(no_category_items[:5])
+        if len(no_category_items) > 5:
+            names_str += f" и ещё {len(no_category_items) - 5}"
+        cat_warn_cell = ws.cell(
+            row=meta_row, column=2,
+            value=f"Категория не определена ({len(no_category_items)} поз.): {names_str}"
+        )
+        cat_warn_cell.font = Font(bold=True, size=10, color="C00000")
+        ws.merge_cells(start_row=meta_row, start_column=2, end_row=meta_row, end_column=9)
+        ws.row_dimensions[meta_row].height = 20
+        meta_row += 1
 
-    kv("Всего характеристик:", total_reqs)
-    kv("Позиций оборудования:", len(results))
-    kv("Найдено моделей (≥80%):", len(all_filtered))
-    best_pct = max((m["match_percentage"] for m in all_filtered), default=0.0)
-    kv("Лучшее совпадение:", f"{best_pct:.1f}%", bold_val=True)
-    kv("Порог отображения:", f"{min_percentage:.0f}%")
+    # ── Разделитель перед таблицами ───────────────────────────────────────────
+    ws.row_dimensions[meta_row].height = 12
+    meta_row += 1
 
-    ws.append([])
-
-    # ── Топ-10 ──
-    r_hdr = ws.max_row + 1
-    ws.append(["Топ-10 совпадений"])
-    ws.merge_cells(start_row=r_hdr, start_column=1, end_row=r_hdr, end_column=5)
-    ws.cell(row=r_hdr, column=1).font = _bold(12)
-    ws.cell(row=r_hdr, column=1).alignment = _left()
-
-    headers = ["№", "Модель", "Совпадение %", "Совпало", "Всего"]
-    ws.append(headers)
-    _header_row(ws, ws.max_row, len(headers))
-
-    # Collect top models (deduplicated by name — pick best %)
-    top_models: Dict[str, Dict] = {}
-    for result in results:
-        total_specs = len(result["requirement"].get("required_specs", {}))
-        for cat in ("ideal", "partial"):
-            for m in result["matches"].get(cat, []):
-                if m["match_percentage"] >= min_percentage:
-                    name = m["model_name"]
-                    if name not in top_models or m["match_percentage"] > top_models[name]["match_percentage"]:
-                        top_models[name] = {**m, "_total_specs": total_specs}
-
-    sorted_top = sorted(top_models.values(), key=lambda x: x["match_percentage"], reverse=True)[:10]
-
-    for i, m in enumerate(sorted_top, 1):
-        pct = m["match_percentage"]
-        matched = len(m.get("matched_specs", []))
-        total = m["_total_specs"]
-        ws.append([i, m["model_name"], f"{pct:.1f}%", matched, total])
-        r_cur = ws.max_row
-        # Color by percentage
-        if pct == 100.0:
-            bg = COLOR_GREEN
-        elif pct >= threshold:
-            bg = COLOR_YELLOW
-        else:
-            bg = COLOR_ORANGE
-        for c in range(1, 6):
-            ws.cell(row=r_cur, column=c).fill = _fill(bg)
-            ws.cell(row=r_cur, column=c).alignment = _center()
-
-    ws.auto_filter.ref = f"A{r_hdr + 1}:E{ws.max_row}"
-    logger.info(f"Summary sheet created: top {len(sorted_top)} models")
+    # ── Таблица по каждой позиции ТЗ ──────────────────────────────────────────
+    cur = meta_row
+    for idx, result in enumerate(results, 1):
+        cur = _summary_single_item_block(ws, result, idx, start_row=cur, col_offset=1)
+        cur += 1  # отступ между блоками
 
 
-# ─── Лист 2: Все совпадения ──────────────────────────────────────────────────
+def _summary_single_item_block(ws, result: dict, idx: int,
+                                start_row: int, col_offset: int) -> int:
+    """Рисует блок одной позиции. Возвращает следующую свободную строку."""
+    _nw_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    _nw_left   = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
 
-def _create_all_matches_sheet(
+    req = result["requirement"]
+    name = req.get("item_name") or req.get("model_name") or f"Позиция {idx}"
+    n_specs = len(_effective_specs(req.get("required_specs", {})))
+
+    # Заголовок блока
+    _merge_row(ws, start_row, col_offset + 1, col_offset + 7,
+               f"Позиция {idx}: {name}   ({n_specs} хар-к)",
+               fill_color="2E75B6",
+               font=Font(bold=True, size=11, color="FFFFFF"),
+               align=_nw_center, height=28)
+
+    # Заголовки колонок
+    hdr_row = start_row + 1
+    hdrs = [
+        ("№",          4),
+        ("Модель",    26),
+        ("Версия",    14),
+        ("Совпадение", 13),
+        ("Совпало",    10),
+        ("Не совп.",   10),
+        ("Нет данных", 11),
+    ]
+    for ci, (h, w) in enumerate(hdrs, col_offset + 1):
+        cell = ws.cell(row=hdr_row, column=ci, value=h)
+        cell.font = Font(bold=True, size=9, color="333333")
+        cell.fill = _fill(COLOR_BLUE_HDR)
+        cell.alignment = _nw_center
+        cell.border = _thin_border()
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[hdr_row].height = 20
+
+    # Данные
+    data_row = hdr_row + 1
+    last_row = hdr_row
+    top_models = _collect_top_models(result, limit=15, filter_by_spec_count=_FILTER_BY_SPEC_COUNT)
+
+    ZEBRA_A = "F7F9FC"
+    ZEBRA_B = "FFFFFF"
+
+    if not top_models:
+        cell = ws.cell(row=data_row, column=col_offset + 1,
+                       value="Нет моделей с совпадением ≥70% и достаточным числом характеристик")
+        cell.font = Font(italic=True, size=10, color="999999")
+        cell.alignment = _nw_left
+        ws.merge_cells(start_row=data_row, start_column=col_offset + 1,
+                       end_row=data_row, end_column=col_offset + len(hdrs))
+        ws.row_dimensions[data_row].height = 22
+        last_row = data_row
+
+    for ri, item in enumerate(top_models, 0):
+        pct = item["pct"]
+        bg = _pct_color(pct)
+        zebra = ZEBRA_A if ri % 2 == 0 else ZEBRA_B
+        vals = [ri + 1, item["model_name"], item["version"],
+                f"{pct:.0f}%", item["matched"],
+                item["different"], item["unmapped"]]
+        for ci, v in enumerate(vals, col_offset + 1):
+            cell = ws.cell(row=data_row + ri, column=ci, value=v)
+            # Колонка "Совпадение" — цветная, модель — жирная
+            if ci == col_offset + 4:
+                cell.fill = _fill(bg)
+                cell.font = Font(bold=True, size=10)
+            elif ci == col_offset + 2:
+                cell.fill = _fill(zebra)
+                cell.font = Font(bold=True, size=10)
+            else:
+                cell.fill = _fill(zebra)
+                cell.font = Font(size=10)
+            cell.alignment = _nw_center if ci != col_offset + 2 else _nw_left
+            cell.border = _thin_border()
+        ws.row_dimensions[data_row + ri].height = 20
+        last_row = data_row + ri
+
+    return last_row + 1
+
+
+def _collect_top_models(result: dict, limit: int = 15,
+                        filter_by_spec_count: bool = True) -> list:
+    """
+    Собирает топ-N моделей для позиции, отсортированных по % совпадения.
+
+    Фильтры:
+    - < THRESHOLD_MIN% совпадения → не показываем
+    - filter_by_spec_count=True: модели с меньшим числом характеристик чем в ТЗ → не показываем
+    """
+    req = result["requirement"]
+    total_specs = len(_effective_specs(req.get("required_specs", {})))
+    rows = []
+    for cat in ("ideal", "partial", "not_matched"):
+        for m in result["matches"].get(cat, []):
+            pct = m["match_percentage"]
+            if pct < THRESHOLD_MIN:
+                continue
+            model_specs = m.get("attributes") or m.get("specifications") or {}
+            if filter_by_spec_count and len(model_specs) < total_specs:
+                continue
+            rows.append({
+                "model_name": m["model_name"],
+                "version": m.get("version") or _parse_version(m.get("source_filename", m.get("source_file", ""))),
+                "pct": pct,
+                "matched": len(m.get("matched_specs", [])),
+                "different": len(m.get("different_specs", {})),
+                "unmapped": len(m.get("unmapped_specs", m.get("missing_specs", []))),
+                "total_specs": total_specs,
+                "model_total_specs": len(model_specs),
+                "match_data": m,
+            })
+    rows.sort(key=lambda x: x["pct"], reverse=True)
+    return rows[:limit]
+
+
+# ─── Листы детального сравнения ──────────────────────────────────────────────
+
+def _create_detail_sheet(
     wb: Workbook,
-    match_results: Dict[str, Any],
-    threshold: int,
-    min_percentage: float,
+    result: dict,
+    position_idx: int,
+    max_models: int = 10,
 ) -> None:
-    ws = wb.create_sheet("Все совпадения")
-
-    headers = ["№", "Модель оборудования", "Позиция ТЗ", "Совпадение %",
-               "Совпало требований", "Не совпало", "Не сопоставлено"]
-    ws.append(headers)
-    _header_row(ws, 1, len(headers))
-
-    row_num = 1
-    for result in match_results.get("results", []):
-        req = result["requirement"]
-        req_name = req.get("item_name") or req.get("model_name") or "—"
-        total_specs = len(req.get("required_specs", {}))
-
-        for cat in ("ideal", "partial", "not_matched"):
-            for m in result["matches"].get(cat, []):
-                pct = m["match_percentage"]
-                if pct < min_percentage:
-                    continue
-                matched = len(m.get("matched_specs", []))
-                different = len(m.get("different_specs", {}))
-                unmapped = len(m.get("unmapped_specs", m.get("missing_specs", [])))
-
-                ws.append([
-                    row_num,
-                    m["model_name"],
-                    req_name,
-                    f"{pct:.1f}%",
-                    matched,
-                    different,
-                    unmapped,
-                ])
-                r = ws.max_row
-                if pct == 100.0:
-                    bg = COLOR_GREEN
-                elif pct >= threshold:
-                    bg = COLOR_YELLOW
-                else:
-                    bg = COLOR_ORANGE
-                for c in range(1, len(headers) + 1):
-                    ws.cell(row=r, column=c).fill = _fill(bg)
-                    ws.cell(row=r, column=c).alignment = _center()
-                row_num += 1
-
-    ws.auto_filter.ref = ws.dimensions
-    _auto_width(ws)
-    logger.info(f"All-matches sheet: {row_num - 1} rows")
-
-
-# ─── Лист 3: Детали совпадений ───────────────────────────────────────────────
-
-def _create_details_sheet(
-    wb: Workbook,
-    match_results: Dict[str, Any],
-    threshold: int,
-    min_percentage: float,
-    max_models: int = 50,
-) -> None:
-    ws = wb.create_sheet("Детали совпадений")
+    """
+    Один лист для одной позиции ТЗ.
+    Колонки: № | Характеристика | Требуется | Модель1 | Модель2 | ...
+    """
+    req = result["requirement"]
+    item_name = req.get("item_name") or req.get("model_name") or f"Позиция {position_idx}"
+    required_specs: Dict[str, Any] = _effective_specs(req.get("required_specs", {}))
     reverse_mapping = _load_reverse_mapping()
 
-    # Fixed column widths
-    ws.column_dimensions["A"].width = 6    # Статус
-    ws.column_dimensions["B"].width = 42   # Характеристика
-    ws.column_dimensions["C"].width = 22   # Требуется
-    ws.column_dimensions["D"].width = 22   # Фактически
-    ws.column_dimensions["E"].width = 30   # Детали
+    top = _collect_top_models(result, limit=max_models, filter_by_spec_count=_FILTER_BY_SPEC_COUNT)
+    if not top:
+        top = []
 
-    current_row = 1
-    model_counter = 0
+    # Безопасное имя листа
+    safe_name = re.sub(r'[\[\]:*?/\\]', '', item_name)[:28]
+    sheet_name = f"Поз.{position_idx} {safe_name}".strip()
+    existing_titles = {s.title for s in wb.worksheets}
+    if sheet_name in existing_titles:
+        sheet_name = f"Поз.{position_idx}_{position_idx}"
 
-    for result in match_results.get("results", []):
-        req = result["requirement"]
-        req_name = req.get("item_name") or req.get("model_name") or "—"
-        required_specs = req.get("required_specs", {})
+    ws = wb.create_sheet(sheet_name)
 
-        for cat in ("ideal", "partial"):
-            for m in result["matches"].get(cat, []):
-                pct = m["match_percentage"]
-                if pct < min_percentage:
-                    continue
-                if model_counter >= max_models:
-                    break
+    n_models = len(top)
+    COL_NUM    = 1
+    COL_CHAR   = 2
+    COL_REQ    = 3
+    COL_FIRST  = 4
+    total_cols = COL_FIRST + n_models - 1 if n_models else COL_FIRST
 
-                model_counter += 1
-                version = _parse_version(m.get("source_file", ""))
-                matched_specs = set(m.get("matched_specs", []))
-                unmapped_specs = set(m.get("unmapped_specs", m.get("missing_specs", [])))
-                different_specs = m.get("different_specs", {})
-                model_specs = m.get("specifications") or {}
+    # Стили без wrap — текст не налезает
+    _no_wrap_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    _no_wrap_left   = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
+    _wrap_center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-                # ── Секция-заголовок модели ──
-                header_text = f"{model_counter}. {m['model_name']} ({req_name}) — {pct:.1f}%"
-                ws.cell(row=current_row, column=1, value=header_text)
-                ws.merge_cells(
-                    start_row=current_row, start_column=1,
-                    end_row=current_row, end_column=5,
-                )
-                cell = ws.cell(row=current_row, column=1)
-                cell.font = Font(bold=True, size=11, color="FFFFFF")
-                cell.fill = _fill("2E75B6")
-                cell.alignment = _left()
-                ws.row_dimensions[current_row].height = 20
-                current_row += 1
+    # ── Строка 1: заголовок ─────────────────────────────────────────────────
+    _merge_row(ws, 1, 1, total_cols,
+               f"Позиция {position_idx}: {item_name}",
+               fill_color="2E75B6",
+               font=Font(bold=True, size=14, color="FFFFFF"),
+               align=_wrap_center, height=32)
 
-                # ── Заголовки колонок ──
-                for ci, hdr in enumerate(["Статус", "Характеристика", "Требуется", "Фактически", "Детали"], 1):
-                    c = ws.cell(row=current_row, column=ci, value=hdr)
-                    c.font = _bold()
-                    c.fill = _fill(COLOR_GRAY)
-                    c.alignment = _center()
-                current_row += 1
+    # ── Строка 2: предупреждение ────────────────────────────────────────────
+    if result.get("category_not_detected"):
+        warn_text = "Категория не определена — подбор не выполнен"
+        warn_color = "C00000"
+    else:
+        warn_text = "Проверьте модели по исходным таблицам каталога"
+        warn_color = "FF8C00"
+    _merge_row(ws, 2, 1, total_cols, warn_text,
+               fill_color=warn_color,
+               font=Font(bold=True, size=9, color="FFFFFF"),
+               align=_no_wrap_center, height=20)
 
-                # ── Строки характеристик ──
-                for spec_i, (key, req_val) in enumerate(required_specs.items()):
-                    readable = reverse_mapping.get(key, key.replace("_", " ").title())
-                    mod_val = model_specs.get(key)
+    # ── Строка 3: пустой разделитель ────────────────────────────────────────
+    ws.row_dimensions[3].height = 4
 
-                    if key in matched_specs:
-                        status = "✓"
-                        bg = COLOR_GREEN
-                        detail = _comparison_detail(req_val, mod_val)
-                    elif key in unmapped_specs:
-                        status = "?"
-                        bg = COLOR_ORANGE
-                        mod_val = "—"
-                        detail = "Нет в каталоге"
-                    elif key in different_specs:
-                        status = "✗"
-                        bg = COLOR_RED
-                        detail = _comparison_detail(req_val, mod_val)
-                    else:
-                        status = "—"
-                        bg = None
-                        detail = ""
+    # ── Строки 4-6: шапка моделей (3 строки: название, версия, процент) ─────
+    HDR_NAME = 4
+    HDR_VER  = 5
+    HDR_PCT  = 6
 
-                    row_bg = bg or (COLOR_LIGHT_GRAY if spec_i % 2 == 0 else None)
+    # Левая часть шапки — merge по вертикали для №, Характеристика, Требуется
+    for ci, label, width in [
+        (COL_NUM,  "№",              4),
+        (COL_CHAR, "Характеристика", 40),
+        (COL_REQ,  "Требуется",      20),
+    ]:
+        ws.merge_cells(start_row=HDR_NAME, start_column=ci,
+                       end_row=HDR_PCT, end_column=ci)
+        cell = ws.cell(row=HDR_NAME, column=ci, value=label)
+        cell.font = _bold(11)
+        cell.fill = _fill(COLOR_BLUE_HDR)
+        cell.alignment = _wrap_center
+        cell.border = _thin_border()
+        # Бордеры для merged cells
+        for r in range(HDR_NAME, HDR_PCT + 1):
+            ws.cell(row=r, column=ci).border = _thin_border()
 
-                    values = [
-                        status,
-                        readable,
-                        str(req_val) if req_val is not None else "—",
-                        str(mod_val) if mod_val is not None else "—",
-                        detail,
-                    ]
-                    for ci, v in enumerate(values, 1):
-                        cell = ws.cell(row=current_row, column=ci, value=v)
-                        if row_bg:
-                            cell.fill = _fill(row_bg)
-                        cell.alignment = _left() if ci > 1 else _center()
-                    current_row += 1
+    # Заголовки моделей — 3 отдельных строки
+    for ci_i, item in enumerate(top):
+        ci = COL_FIRST + ci_i
+        pct = item["pct"]
+        bg = _pct_color(pct)
 
-                # Empty separator row
-                current_row += 1
+        # Строка 4: название модели
+        c1 = ws.cell(row=HDR_NAME, column=ci, value=item["model_name"])
+        c1.font = _bold(11)
+        c1.fill = _fill(COLOR_BLUE_HDR)
+        c1.alignment = _no_wrap_center
+        c1.border = _thin_border()
 
-            if model_counter >= max_models:
-                break
+        # Строка 5: версия
+        c2 = ws.cell(row=HDR_VER, column=ci, value=item["version"])
+        c2.font = Font(size=9, color="555555")
+        c2.fill = _fill(COLOR_BLUE_HDR)
+        c2.alignment = _no_wrap_center
+        c2.border = _thin_border()
 
-    logger.info(f"Details sheet: {model_counter} models, {current_row - 1} rows")
+        # Строка 6: процент (с цветом)
+        c3 = ws.cell(row=HDR_PCT, column=ci, value=f"{pct:.0f}%")
+        c3.font = _bold(12)
+        c3.fill = _fill(bg)
+        c3.alignment = _no_wrap_center
+        c3.border = _thin_border()
+
+    ws.row_dimensions[HDR_NAME].height = 22
+    ws.row_dimensions[HDR_VER].height = 16
+    ws.row_dimensions[HDR_PCT].height = 22
+
+    # ── Строки данных ───────────────────────────────────────────────────────
+    data_start = HDR_PCT + 1
+    ZEBRA_A = "F7F9FC"   # светло-голубоватый
+    ZEBRA_B = "FFFFFF"   # белый
+
+    for ri, (key, req_val) in enumerate(required_specs.items()):
+        row = data_start + ri
+        readable = reverse_mapping.get(key, key.replace("_", " ").title())
+        zebra = ZEBRA_A if ri % 2 == 0 else ZEBRA_B
+
+        # Статус каждой модели по этому ключу
+        statuses = []
+        for item in top:
+            m = item["match_data"]
+            if key in set(m.get("matched_specs", [])):
+                statuses.append("match")
+            elif key in set(m.get("unmapped_specs", m.get("missing_specs", []))):
+                statuses.append("unmapped")
+            elif key in m.get("different_specs", {}):
+                statuses.append("diff")
+            else:
+                statuses.append("none")
+
+        # № строки
+        nc = ws.cell(row=row, column=COL_NUM, value=ri + 1)
+        nc.font = Font(size=9, color="999999")
+        nc.fill = _fill(zebra)
+        nc.alignment = _no_wrap_center
+        nc.border = _thin_border()
+
+        # Характеристика
+        cc = ws.cell(row=row, column=COL_CHAR, value=readable)
+        cc.font = Font(size=10)
+        cc.fill = _fill(zebra)
+        cc.alignment = _no_wrap_left
+        cc.border = _thin_border()
+
+        # Требуется
+        rc = ws.cell(row=row, column=COL_REQ, value=_fmt_val(req_val))
+        rc.font = Font(size=10, bold=True)
+        rc.fill = _fill(zebra)
+        rc.alignment = _no_wrap_center
+        rc.border = _thin_border()
+
+        # Колонки моделей
+        for ci_i, (item, status) in enumerate(zip(top, statuses)):
+            ci = COL_FIRST + ci_i
+            m = item["match_data"]
+            model_specs = m.get("attributes") or m.get("specifications") or {}
+            mod_val = model_specs.get(key)
+
+            if status == "match":
+                cell_bg = COLOR_GREEN
+                display = _fmt_val(mod_val)
+                font = Font(size=10)
+            elif status == "unmapped":
+                cell_bg = COLOR_LIGHT_GRAY
+                display = "—"
+                font = Font(size=10, color="999999")
+            elif status == "diff":
+                cell_bg = COLOR_RED
+                display = _fmt_val(mod_val)
+                font = Font(size=10)
+            else:
+                cell_bg = zebra
+                display = _fmt_val(mod_val) if mod_val is not None else "—"
+                font = Font(size=10, color="666666")
+
+            cell = ws.cell(row=row, column=ci, value=display)
+            cell.fill = _fill(cell_bg)
+            cell.font = font
+            cell.alignment = _no_wrap_center
+            cell.border = _thin_border()
+
+        ws.row_dimensions[row].height = 22
+
+    # ── Итоговая строка ─────────────────────────────────────────────────────
+    if top and required_specs:
+        summary_row = data_start + len(required_specs)
+        ws.row_dimensions[summary_row].height = 4  # тонкий разделитель
+
+        totals_row = summary_row + 1
+        ws.cell(row=totals_row, column=COL_CHAR,
+                value="ИТОГО").font = _bold(11)
+        ws.cell(row=totals_row, column=COL_REQ,
+                value=f"{len(required_specs)} хар-к").font = _bold(10)
+        ws.cell(row=totals_row, column=COL_REQ).alignment = _no_wrap_center
+        for ci_i, item in enumerate(top):
+            ci = COL_FIRST + ci_i
+            bg = _pct_color(item["pct"])
+            matched = item["matched"]
+            total = item["total_specs"]
+            cell = ws.cell(row=totals_row, column=ci,
+                           value=f"{matched}/{total}")
+            cell.font = _bold(11)
+            cell.fill = _fill(bg)
+            cell.alignment = _no_wrap_center
+            cell.border = _thin_border()
+        ws.row_dimensions[totals_row].height = 24
+
+    # ── Ширина колонок ──────────────────────────────────────────────────────
+    ws.column_dimensions[get_column_letter(COL_NUM)].width = 5
+    ws.column_dimensions[get_column_letter(COL_CHAR)].width = 42
+    ws.column_dimensions[get_column_letter(COL_REQ)].width = 22
+    for ci_i in range(n_models):
+        # Ширина по длине названия модели (мин 18, макс 30)
+        name_len = len(top[ci_i]["model_name"]) if ci_i < len(top) else 0
+        w = max(18, min(name_len + 6, 30))
+        ws.column_dimensions[get_column_letter(COL_FIRST + ci_i)].width = w
+
+    # Закрепление шапки + левых колонок
+    ws.freeze_panes = ws.cell(row=data_start, column=COL_FIRST)
+
+    logger.info(f"Detail sheet '{sheet_name}': {len(required_specs)} specs, {n_models} models")
 
 
-# ─── Лист 4: Не сопоставленные ───────────────────────────────────────────────
+_OP_UNICODE = {">=": "≥", "<=": "≤", "!=": "≠", ">": ">", "<": "<", "=": "="}
 
-def _create_unmatched_sheet(
-    wb: Workbook,
-    match_results: Dict[str, Any],
-    min_percentage: float,
-) -> None:
-    ws = wb.create_sheet("Не сопоставленные")
 
-    has_unmatched = False
-    for result in match_results.get("results", []):
-        matches = result["matches"]
-        all_above = any(
-            m["match_percentage"] >= min_percentage
-            for cat in ("ideal", "partial", "not_matched")
-            for m in matches.get(cat, [])
-        )
-        if not all_above:
-            has_unmatched = True
-            break
+def _fmt_op_str(s: str) -> str:
+    """'>512' → '> 512',  '<=1024' → '≤ 1024'."""
+    m = re.match(r'^([><=!]{1,2})\s*(.+)$', s.strip())
+    if m:
+        op = _OP_UNICODE.get(m.group(1), m.group(1))
+        return f"{op} {m.group(2).strip()}"
+    return s
 
-    if not has_unmatched:
-        ws.append(["Все требования сопоставлены с базой данных"])
-        ws.cell(row=1, column=1).font = _bold()
-        ws.cell(row=1, column=1).fill = _fill(COLOR_GREEN)
-        return
 
-    headers = ["№", "Позиция ТЗ", "Категория", "Лучшее совпадение %", "Характеристик"]
-    ws.append(headers)
-    _header_row(ws, 1, len(headers))
+def _fmt_val(val: Any) -> str:
+    if val is None:
+        return "—"
+    if isinstance(val, bool):
+        return "Да" if val else "Нет"
+    if isinstance(val, list):
+        return " и ".join(_fmt_op_str(str(v)) for v in val)
+    if isinstance(val, str):
+        return _fmt_op_str(val) if re.match(r'^[><=!]', val) else val
+    return str(val)
 
-    row_num = 1
-    for result in match_results.get("results", []):
-        req = result["requirement"]
-        matches = result["matches"]
-        req_name = req.get("item_name") or req.get("model_name") or "—"
-        category = req.get("category") or "—"
-        n_specs = len(req.get("required_specs", {}))
 
-        all_models = (
-            matches.get("ideal", [])
-            + matches.get("partial", [])
-            + matches.get("not_matched", [])
-        )
-        best = max((m["match_percentage"] for m in all_models), default=0.0)
-
-        if best < min_percentage:
-            ws.append([row_num, req_name, category, f"{best:.1f}%", n_specs])
-            r = ws.max_row
-            for c in range(1, len(headers) + 1):
-                ws.cell(row=r, column=c).fill = _fill(COLOR_RED if best == 0 else COLOR_ORANGE)
-                ws.cell(row=r, column=c).alignment = _center()
-            row_num += 1
-
-    _auto_width(ws)
+def _effective_specs(specs: dict) -> dict:
+    """Remove internal keys (e.g. __canonical__) from required_specs."""
+    return {k: v for k, v in specs.items() if not k.startswith("__")}
 
 
 # ─── Публичная функция ────────────────────────────────────────────────────────
+
+# Флаг фильтрации — устанавливается в generate_report из настроек
+_FILTER_BY_SPEC_COUNT: bool = True
+
 
 def generate_report(
     requirements: Dict[str, Any],
     match_results: Dict[str, Any],
     output_dir: str = "temp_files",
-    threshold: int = 70,
-    min_percentage: float = 80.0,
+    min_percentage: float = 75.0,
     filename: str = "",
     processing_time: float = 0.0,
 ) -> str:
     """
-    Генерация Excel отчёта с результатами сопоставления.
+    Генерация Excel отчёта.
 
-    Структура файла:
-    - Сводка             — метаданные + статистика + топ-10
-    - Все совпадения     — плоский список всех моделей ≥ min_percentage
-    - Детали совпадений  — построчное сравнение (топ-50 моделей)
-    - Не сопоставленные  — позиции без подходящих моделей
+    Структура:
+    - Лист "Сводка": предупреждение + метаданные + таблица по каждой позиции
+    - Листы "Поз. N ...": детальное сравнение характеристик (одна позиция на лист)
     """
-    logger.info(f"Generating Excel report (min={min_percentage}%, threshold={threshold}%)…")
+    global _FILTER_BY_SPEC_COUNT
+    try:
+        from config import settings
+        # Note: with EAV+fuzzy matching, 'specifications' only contains matched values
+        # (not all model specs). Enabling filter_by_spec_count may exclude valid models.
+        # Default remains False unless explicitly enabled via FILTER_BY_SPEC_COUNT=true.
+        _FILTER_BY_SPEC_COUNT = settings.filter_by_spec_count
+    except Exception:
+        _FILTER_BY_SPEC_COUNT = False
+
+    logger.info(
+        f"Generating Excel report (green≥{THRESHOLD_GREEN}%, yellow≥{THRESHOLD_YELLOW}%, "
+        f"min≥{THRESHOLD_MIN}%, filter_by_spec_count={_FILTER_BY_SPEC_COUNT})…"
+    )
 
     wb = Workbook()
+    results = match_results.get("results", [])
 
-    _create_summary_sheet(wb, match_results, filename, processing_time, threshold, min_percentage)
-    _create_all_matches_sheet(wb, match_results, threshold, min_percentage)
-    _create_details_sheet(wb, match_results, threshold, min_percentage)
-    _create_unmatched_sheet(wb, match_results, min_percentage)
+    _create_summary_sheet(wb, match_results, filename, processing_time)
+
+    for idx, result in enumerate(results, 1):
+        _create_detail_sheet(wb, result, idx, max_models=10)
 
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_path = os.path.join(output_dir, f"tender_match_report_{timestamp}.xlsx")
     wb.save(file_path)
 
-    logger.info(f"Excel report saved: {file_path} ({len(wb.sheetnames)} sheets)")
+    logger.info(f"Excel saved: {file_path} ({len(wb.sheetnames)} sheets)")
     return file_path
