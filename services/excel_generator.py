@@ -21,13 +21,13 @@ from openpyxl.utils import get_column_letter
 
 from utils.logger import logger
 
-# ─── Пороги цветовой схемы ────────────────────────────────────────────────────
+# Пороги цветовой схемы
 THRESHOLD_GREEN  = 85.0   # ≥ 85% → зелёный
 THRESHOLD_YELLOW = 70.0   # 70–84% → жёлтый
 THRESHOLD_ORANGE = 50.0   # 50–69% → оранжевый
-THRESHOLD_MIN    = 50.0   # < 50% → не показываем вообще
+THRESHOLD_MIN    = 50.0   # < 50% → не показываем
 
-# ─── Цвета ───────────────────────────────────────────────────────────────────
+# Цвета ячеек
 COLOR_GREEN       = "C6EFCE"
 COLOR_YELLOW      = "FFEB9C"
 COLOR_ORANGE      = "FFD699"
@@ -35,10 +35,9 @@ COLOR_RED         = "FFC7CE"
 COLOR_GRAY        = "D9D9D9"
 COLOR_LIGHT_GRAY  = "F2F2F2"
 COLOR_BLUE_HDR    = "BDD7EE"
-COLOR_WARN_BG     = "FF0000"   # фон плашки предупреждения
+COLOR_WARN_BG     = "FF0000"
 COLOR_WARN_TEXT   = "FFFFFF"
 
-# ─── Reverse mapping ─────────────────────────────────────────────────────────
 _REVERSE_MAPPING_CACHE: Optional[Dict[str, str]] = None
 
 
@@ -60,7 +59,6 @@ def _readable_key(key: str) -> str:
     return _load_reverse_mapping().get(key, key.replace("_", " ").title())
 
 
-# ─── Версия из source_file ────────────────────────────────────────────────────
 
 def _parse_version(source_file: str) -> str:
     if not source_file:
@@ -81,7 +79,6 @@ def _parse_version(source_file: str) -> str:
     return source_file
 
 
-# ─── Цвет по проценту ────────────────────────────────────────────────────────
 
 def _pct_color(pct: float) -> str:
     if pct >= THRESHOLD_GREEN:
@@ -93,7 +90,6 @@ def _pct_color(pct: float) -> str:
     return COLOR_RED
 
 
-# ─── Вспомогательные функции ─────────────────────────────────────────────────
 
 def _fill(color: str) -> PatternFill:
     return PatternFill(start_color=color, end_color=color, fill_type="solid")
@@ -134,7 +130,6 @@ def _auto_width(ws, min_w: int = 8, max_w: int = 60) -> None:
 
 def _set_row(ws, row: int, values: list, fills=None, fonts=None, aligns=None,
              height: int = None, border: bool = False) -> None:
-    """Write a row and optionally apply styles."""
     for ci, v in enumerate(values, 1):
         cell = ws.cell(row=row, column=ci, value=v)
         if fills and ci - 1 < len(fills) and fills[ci - 1]:
@@ -176,7 +171,6 @@ def _comparison_detail(req_val: Any, mod_val: Any) -> str:
     return ""
 
 
-# ─── Лист "Сводка" ────────────────────────────────────────────────────────────
 
 def _create_summary_sheet(
     wb: Workbook,
@@ -187,7 +181,7 @@ def _create_summary_sheet(
     ws = wb.active
     ws.title = "Сводка"
     ws.sheet_properties.tabColor = "2E75B6"
-    ws.column_dimensions["A"].width = 2   # узкий отступ
+    ws.column_dimensions["A"].width = 2
 
     _nw_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
     _nw_left   = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
@@ -195,7 +189,6 @@ def _create_summary_sheet(
     results = match_results.get("results", [])
     n_items = len(results)
 
-    # ── Строка 1: заголовок отчёта ────────────────────────────────────────────
     n_cols = 10
     _merge_row(ws, 1, 1, n_cols,
                "Отчёт по подбору оборудования",
@@ -203,17 +196,14 @@ def _create_summary_sheet(
                font=Font(bold=True, size=16, color="FFFFFF"),
                align=_nw_center, height=36)
 
-    # ── Строка 2: предупреждение ──────────────────────────────────────────────
     _merge_row(ws, 2, 1, n_cols,
                "Программа может допускать ошибки — проверьте модели по исходным таблицам каталога",
                fill_color="FF8C00",
                font=Font(bold=True, size=10, color="FFFFFF"),
                align=_nw_center, height=22)
 
-    # ── Строка 3: разделитель ─────────────────────────────────────────────────
     ws.row_dimensions[3].height = 6
 
-    # ── Метаданные ────────────────────────────────────────────────────────────
     total_specs_all = sum(
         len(_effective_specs(r.get("requirement", {}).get("required_specs", {})))
         for r in results
@@ -239,7 +229,6 @@ def _create_summary_sheet(
         ws.row_dimensions[meta_row].height = 18
         meta_row += 1
 
-    # ── Предупреждение о позициях без категории ───────────────────────────────
     no_category_items = [
         r["requirement"].get("item_name") or r["requirement"].get("model_name") or f"Позиция {i+1}"
         for i, r in enumerate(results)
@@ -262,11 +251,10 @@ def _create_summary_sheet(
     ws.row_dimensions[meta_row].height = 12
     meta_row += 1
 
-    # ── Таблица по каждой позиции ТЗ ──────────────────────────────────────────
     cur = meta_row
     for idx, result in enumerate(results, 1):
         cur = _summary_single_item_block(ws, result, idx, start_row=cur, col_offset=1)
-        cur += 1  # отступ между блоками
+        cur += 1
 
 
 def _summary_single_item_block(ws, result: dict, idx: int,
@@ -279,14 +267,12 @@ def _summary_single_item_block(ws, result: dict, idx: int,
     name = req.get("item_name") or req.get("model_name") or f"Позиция {idx}"
     n_specs = len(_effective_specs(req.get("required_specs", {})))
 
-    # Заголовок блока
     _merge_row(ws, start_row, col_offset + 1, col_offset + 7,
                f"Позиция {idx}: {name}   ({n_specs} хар-к)",
                fill_color="2E75B6",
                font=Font(bold=True, size=11, color="FFFFFF"),
                align=_nw_center, height=28)
 
-    # Заголовки колонок
     hdr_row = start_row + 1
     hdrs = [
         ("№",          4),
@@ -333,8 +319,7 @@ def _summary_single_item_block(ws, result: dict, idx: int,
                 item["different"], item["unmapped"]]
         for ci, v in enumerate(vals, col_offset + 1):
             cell = ws.cell(row=data_row + ri, column=ci, value=v)
-            # Колонка "Совпадение" — цветная, модель — жирная
-            if ci == col_offset + 4:
+            if ci == col_offset + 4:  # колонка "Совпадение" — цветная
                 cell.fill = _fill(bg)
                 cell.font = Font(bold=True, size=10)
             elif ci == col_offset + 2:
@@ -386,7 +371,6 @@ def _collect_top_models(result: dict, limit: int = 15,
     return rows[:limit]
 
 
-# ─── Листы детального сравнения ──────────────────────────────────────────────
 
 def _create_detail_sheet(
     wb: Workbook,
@@ -407,7 +391,6 @@ def _create_detail_sheet(
     if not top:
         top = []
 
-    # Безопасное имя листа
     safe_name = re.sub(r'[\[\]:*?/\\]', '', item_name)[:28]
     sheet_name = f"Поз.{position_idx} {safe_name}".strip()
     existing_titles = {s.title for s in wb.worksheets}
@@ -423,19 +406,16 @@ def _create_detail_sheet(
     COL_FIRST  = 4
     total_cols = COL_FIRST + n_models - 1 if n_models else COL_FIRST
 
-    # Стили без wrap — текст не налезает
     _no_wrap_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
     _no_wrap_left   = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
     _wrap_center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # ── Строка 1: заголовок ─────────────────────────────────────────────────
     _merge_row(ws, 1, 1, total_cols,
                f"Позиция {position_idx}: {item_name}",
                fill_color="2E75B6",
                font=Font(bold=True, size=14, color="FFFFFF"),
                align=_wrap_center, height=32)
 
-    # ── Строка 2: предупреждение ────────────────────────────────────────────
     if result.get("category_not_detected"):
         warn_text = "Категория не определена — подбор не выполнен"
         warn_color = "C00000"
@@ -450,12 +430,12 @@ def _create_detail_sheet(
     # ── Строка 3: пустой разделитель ────────────────────────────────────────
     ws.row_dimensions[3].height = 4
 
-    # ── Строки 4-6: шапка моделей (3 строки: название, версия, процент) ─────
+    # Шапка: строки 4–6 (название модели, версия, процент)
     HDR_NAME = 4
     HDR_VER  = 5
     HDR_PCT  = 6
 
-    # Левая часть шапки — merge по вертикали для №, Характеристика, Требуется
+    # Левые колонки (№, Характеристика, Требуется) — merge по вертикали
     for ci, label, width in [
         (COL_NUM,  "№",              4),
         (COL_CHAR, "Характеристика", 40),
@@ -468,31 +448,26 @@ def _create_detail_sheet(
         cell.fill = _fill(COLOR_BLUE_HDR)
         cell.alignment = _wrap_center
         cell.border = _thin_border()
-        # Бордеры для merged cells
         for r in range(HDR_NAME, HDR_PCT + 1):
             ws.cell(row=r, column=ci).border = _thin_border()
 
-    # Заголовки моделей — 3 отдельных строки
     for ci_i, item in enumerate(top):
         ci = COL_FIRST + ci_i
         pct = item["pct"]
         bg = _pct_color(pct)
 
-        # Строка 4: название модели
         c1 = ws.cell(row=HDR_NAME, column=ci, value=item["model_name"])
         c1.font = _bold(11)
         c1.fill = _fill(COLOR_BLUE_HDR)
         c1.alignment = _no_wrap_center
         c1.border = _thin_border()
 
-        # Строка 5: версия
         c2 = ws.cell(row=HDR_VER, column=ci, value=item["version"])
         c2.font = Font(size=9, color="555555")
         c2.fill = _fill(COLOR_BLUE_HDR)
         c2.alignment = _no_wrap_center
         c2.border = _thin_border()
 
-        # Строка 6: процент (с цветом)
         c3 = ws.cell(row=HDR_PCT, column=ci, value=f"{pct:.0f}%")
         c3.font = _bold(12)
         c3.fill = _fill(bg)
@@ -503,17 +478,15 @@ def _create_detail_sheet(
     ws.row_dimensions[HDR_VER].height = 16
     ws.row_dimensions[HDR_PCT].height = 22
 
-    # ── Строки данных ───────────────────────────────────────────────────────
     data_start = HDR_PCT + 1
-    ZEBRA_A = "F7F9FC"   # светло-голубоватый
-    ZEBRA_B = "FFFFFF"   # белый
+    ZEBRA_A = "F7F9FC"
+    ZEBRA_B = "FFFFFF"
 
     for ri, (key, req_val) in enumerate(required_specs.items()):
         row = data_start + ri
         readable = reverse_mapping.get(key, key.replace("_", " ").title())
         zebra = ZEBRA_A if ri % 2 == 0 else ZEBRA_B
 
-        # Статус каждой модели по этому ключу
         statuses = []
         for item in top:
             m = item["match_data"]
@@ -533,21 +506,18 @@ def _create_detail_sheet(
         nc.alignment = _no_wrap_center
         nc.border = _thin_border()
 
-        # Характеристика
         cc = ws.cell(row=row, column=COL_CHAR, value=readable)
         cc.font = Font(size=10)
         cc.fill = _fill(zebra)
         cc.alignment = _no_wrap_left
         cc.border = _thin_border()
 
-        # Требуется
         rc = ws.cell(row=row, column=COL_REQ, value=_fmt_val(req_val))
         rc.font = Font(size=10, bold=True)
         rc.fill = _fill(zebra)
         rc.alignment = _no_wrap_center
         rc.border = _thin_border()
 
-        # Колонки моделей
         for ci_i, (item, status) in enumerate(zip(top, statuses)):
             ci = COL_FIRST + ci_i
             m = item["match_data"]
@@ -579,10 +549,9 @@ def _create_detail_sheet(
 
         ws.row_dimensions[row].height = 22
 
-    # ── Итоговая строка ─────────────────────────────────────────────────────
     if top and required_specs:
         summary_row = data_start + len(required_specs)
-        ws.row_dimensions[summary_row].height = 4  # тонкий разделитель
+        ws.row_dimensions[summary_row].height = 4
 
         totals_row = summary_row + 1
         ws.cell(row=totals_row, column=COL_CHAR,
@@ -603,7 +572,6 @@ def _create_detail_sheet(
             cell.border = _thin_border()
         ws.row_dimensions[totals_row].height = 24
 
-    # ── Ширина колонок ──────────────────────────────────────────────────────
     ws.column_dimensions[get_column_letter(COL_NUM)].width = 5
     ws.column_dimensions[get_column_letter(COL_CHAR)].width = 42
     ws.column_dimensions[get_column_letter(COL_REQ)].width = 22
@@ -644,13 +612,11 @@ def _fmt_val(val: Any) -> str:
 
 
 def _effective_specs(specs: dict) -> dict:
-    """Remove internal keys (e.g. __canonical__) from required_specs."""
+    """Убрать внутренние ключи (например, __canonical__) из required_specs."""
     return {k: v for k, v in specs.items() if not k.startswith("__")}
 
 
-# ─── Публичная функция ────────────────────────────────────────────────────────
-
-# Флаг фильтрации — устанавливается в generate_report из настроек
+# Устанавливается в generate_report из настроек приложения
 _FILTER_BY_SPEC_COUNT: bool = True
 
 
@@ -672,16 +638,15 @@ def generate_report(
     global _FILTER_BY_SPEC_COUNT
     try:
         from config import settings
-        # Note: with EAV+fuzzy matching, 'specifications' only contains matched values
-        # (not all model specs). Enabling filter_by_spec_count may exclude valid models.
-        # Default remains False unless explicitly enabled via FILTER_BY_SPEC_COUNT=true.
+        # При EAV+fuzzy-матчинге 'specifications' содержит только совпавшие значения,
+        # поэтому filter_by_spec_count может ложно исключать подходящие модели.
         _FILTER_BY_SPEC_COUNT = settings.filter_by_spec_count
     except Exception:
         _FILTER_BY_SPEC_COUNT = False
 
     logger.info(
-        f"Generating Excel report (green≥{THRESHOLD_GREEN}%, yellow≥{THRESHOLD_YELLOW}%, "
-        f"min≥{THRESHOLD_MIN}%, filter_by_spec_count={_FILTER_BY_SPEC_COUNT})…"
+        f"Генерация Excel-отчёта (зелёный≥{THRESHOLD_GREEN}%, жёлтый≥{THRESHOLD_YELLOW}%, "
+        f"мин≥{THRESHOLD_MIN}%, filter_by_spec_count={_FILTER_BY_SPEC_COUNT})…"
     )
 
     wb = Workbook()
@@ -697,5 +662,5 @@ def generate_report(
     file_path = os.path.join(output_dir, f"tender_match_report_{timestamp}.xlsx")
     wb.save(file_path)
 
-    logger.info(f"Excel saved: {file_path} ({len(wb.sheetnames)} sheets)")
+    logger.info(f"Excel сохранён: {file_path} ({len(wb.sheetnames)} листов)")
     return file_path

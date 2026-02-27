@@ -4,7 +4,7 @@ from logging.handlers import RotatingFileHandler
 
 
 def setup_logger(log_level: str = "INFO") -> logging.Logger:
-    """Configure and return the application logger."""
+    """Настроить и вернуть логгер приложения."""
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
     os.makedirs(log_dir, exist_ok=True)
 
@@ -16,25 +16,23 @@ def setup_logger(log_level: str = "INFO") -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # File handler — general log
     file_handler = RotatingFileHandler(
         os.path.join(log_dir, "bot.log"),
-        maxBytes=10 * 1024 * 1024,  # 10 MB
+        maxBytes=10 * 1024 * 1024,  # 10 МБ
         backupCount=5,
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # File handler — errors only
+    # Только ошибки
     error_handler = RotatingFileHandler(
         os.path.join(log_dir, "errors.log"),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
+        maxBytes=5 * 1024 * 1024,  # 5 МБ
         backupCount=3,
         encoding="utf-8",
     )

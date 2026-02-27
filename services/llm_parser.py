@@ -1,4 +1,4 @@
-"""LLM-powered TZ parser using OpenAI API."""
+"""Парсер технических заданий на основе OpenAI API."""
 
 import json
 import os
@@ -7,15 +7,13 @@ from typing import Any, Dict, List, Optional
 
 from utils.logger import logger
 
-# ──────────────────────────── Canonical vocabulary ──────────────
-
 _NORMALIZATION_MAP_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "data", "normalization_map.json"
 )
 
 
 def _load_canonical_vocab() -> Dict[str, str]:
-    """Load {canonical_key: first_synonym} for the LLM prompt."""
+    """Загрузить словарь {canonical_key: первый синоним} для промпта LLM."""
     try:
         with open(_NORMALIZATION_MAP_PATH, encoding="utf-8") as f:
             data = json.load(f)
@@ -31,7 +29,6 @@ def _load_canonical_vocab() -> Dict[str, str]:
 
 CANONICAL_VOCAB: Dict[str, str] = _load_canonical_vocab()
 
-# ──────────────────────────── Prompt ────────────────────────────
 
 _SYSTEM_PROMPT_TEMPLATE = """Ты парсер технических заданий на сетевое оборудование (коммутаторы, маршрутизаторы).
 Извлеки все позиции оборудования и их характеристики из текста ТЗ.
@@ -61,16 +58,14 @@ _SYSTEM_PROMPT_TEMPLATE = """Ты парсер технических задан
 
 
 def _build_vocab_snippet() -> str:
-    """Build a compact vocab string for the prompt (max ~60 entries)."""
+    """Формирует компактный словарь для промпта (максимум ~60 записей)."""
     lines = []
     for key, name in list(CANONICAL_VOCAB.items())[:60]:
         lines.append(f'  "{key}": "{name}"')
     return "{\n" + ",\n".join(lines) + "\n}"
 
 
-# ──────────────────────────── Client ────────────────────────────
-
-_client = None  # lazy init
+_client = None  # ленивая инициализация
 
 
 def _get_client():
@@ -82,11 +77,8 @@ def _get_client():
     return _client
 
 
-# ──────────────────────────── Normalizer ────────────────────────
-
-
 def _normalize_llm_output(data: dict) -> dict:
-    """Convert LLM JSON format to internal requirements format."""
+    """Привести JSON-ответ LLM к внутреннему формату требований."""
     items = []
     for item in data.get("items", []):
         required_specs: Dict[str, Any] = {}
@@ -127,19 +119,15 @@ def _normalize_llm_output(data: dict) -> dict:
     return {"items": items}
 
 
-# ──────────────────────────── Main API ──────────────────────────
-
-
 async def parse_tz_with_llm(document_text: str) -> Optional[dict]:
     """
-    Parse TZ document with LLM.
-
-    Returns requirements dict (same format as table_parser) or None on failure.
+    Разбор документа ТЗ с помощью LLM.
+    Возвращает словарь требований (формат как у table_parser) или None при ошибке.
     """
     try:
         client = _get_client()
     except Exception as e:
-        logger.error(f"LLM client init failed: {e}")
+        logger.error(f"Инициализация LLM-клиента не удалась: {e}")
         return None
 
     system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
@@ -157,20 +145,20 @@ async def parse_tz_with_llm(document_text: str) -> Optional[dict]:
             ],
         )
         raw = resp.choices[0].message.content
-        # Use raw_decode to find the first valid JSON object without greedy matching
+        # raw_decode: находим первый валидный JSON без жадного поиска
         try:
             start_idx = raw.index('{')
             decoder = json.JSONDecoder()
             data, _ = decoder.raw_decode(raw, start_idx)
         except (ValueError, json.JSONDecodeError):
-            logger.warning("LLM parser: no JSON found in response")
+            logger.warning("LLM parser: JSON не найден в ответе")
             return None
         result = _normalize_llm_output(data)
         if result.get("items"):
-            logger.info(f"LLM parser: {len(result['items'])} items extracted")
+            logger.info(f"LLM parser: извлечено {len(result['items'])} позиций")
             return result
-        logger.warning("LLM parser: items list is empty")
+        logger.warning("LLM parser: список позиций пуст")
         return None
     except Exception as e:
-        logger.error(f"LLM parser failed: {e}")
+        logger.error(f"LLM parser завершился с ошибкой: {e}")
         return None

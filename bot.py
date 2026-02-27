@@ -27,7 +27,6 @@ def _run_migrations() -> None:
 async def main() -> None:
     logger.info("Starting tender matcher bot...")
 
-    # Apply database migrations before starting the bot
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _run_migrations)
 
@@ -38,10 +37,8 @@ async def main() -> None:
 
     dp = Dispatcher()
 
-    # Register middleware
     dp.message.middleware(AuthMiddleware())
 
-    # Register routers
     dp.include_router(start.router)
     dp.include_router(stats.router)
     dp.include_router(document.router)

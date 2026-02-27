@@ -1,4 +1,4 @@
-"""Handler for /stats command — shows equipment DB statistics."""
+"""Обработчик команды /stats — статистика базы оборудования."""
 
 from aiogram import Router
 from aiogram.filters import Command
@@ -12,12 +12,11 @@ router = Router()
 
 @router.message(Command("stats"))
 async def stats_handler(message: Message) -> None:
-    """Show equipment count grouped by category."""
-    logger.info(f"/stats from {message.from_user.id}")
+    logger.info(f"/stats от {message.from_user.id}")
     try:
         stats = await get_stats()
     except Exception as e:
-        logger.error(f"Failed to get stats: {e}")
+        logger.error(f"Ошибка при получении статистики: {e}")
         await message.answer("Не удалось получить статистику. Попробуйте позже.")
         return
 

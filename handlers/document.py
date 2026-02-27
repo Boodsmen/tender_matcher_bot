@@ -1,4 +1,4 @@
-"""Handler for uploaded documents (DOCX, PDF)."""
+"""Обработчик загруженных документов (DOCX, PDF)."""
 
 import os
 import time as _time
@@ -19,7 +19,7 @@ from utils.logger import logger
 
 
 def _extract_text_from_docx(file_path: str) -> str:
-    """Extract plain text from DOCX paragraphs for LLM input."""
+    """Извлечь плоский текст из DOCX (абзацы + таблицы) для передачи в LLM."""
     try:
         from docx import Document
         doc = Document(file_path)
@@ -40,7 +40,7 @@ TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp_files"
 
 
 async def _safe_edit(msg, text: str) -> None:
-    """Edit message text, ignoring 'message is not modified' errors."""
+    """Редактировать текст сообщения, игнорируя ошибку «сообщение не изменилось»."""
     try:
         await msg.edit_text(text)
     except Exception as e:
@@ -49,7 +49,7 @@ async def _safe_edit(msg, text: str) -> None:
 
 
 async def extract_from_pdf(file_path: str) -> Optional[str]:
-    """Extract text and tables from a PDF file. Returns None if extraction fails."""
+    """Извлечь текст и таблицы из PDF. При ошибке возвращает None."""
     try:
         import pdfplumber
     except ImportError:
@@ -82,16 +82,12 @@ async def extract_from_pdf(file_path: str) -> Optional[str]:
 
 
 async def _parse_pdf_inline(file_path: str) -> Optional[dict]:
-    """
-    Parse a PDF by extracting text, then trying inline pattern matching.
-    Returns requirements dict or None.
-    """
+    """Извлечь текст из PDF и разобрать его по строчному формату. Возвращает dict или None."""
     pdf_text = await extract_from_pdf(file_path)
     if not pdf_text:
         return None
 
     try:
-        # Build a minimal requirements dict from text patterns
         from services.table_parser import _parse_inline_block, parse_value
         import re
 
@@ -182,7 +178,7 @@ async def _parse_pdf_inline(file_path: str) -> Optional[dict]:
 
 @router.message(lambda m: m.document is not None)
 async def handle_document(message: Message, bot: Bot) -> None:
-    """Download and process an uploaded document (DOCX or PDF)."""
+    """Скачать и обработать загруженный документ (DOCX или PDF)."""
     doc = message.document
     file_name = doc.file_name or "unknown"
     user_id = message.from_user.id
@@ -210,7 +206,6 @@ async def handle_document(message: Message, bot: Bot) -> None:
     excel_path = None
 
     try:
-        # Download file
         file = await bot.get_file(doc.file_id)
         await bot.download_file(file.file_path, file_path)
         logger.info(f"File downloaded to {file_path}")
@@ -220,11 +215,10 @@ async def handle_document(message: Message, bot: Bot) -> None:
 
         requirements = None
 
-        # ── DOCX path ──
         if is_docx:
-            # Step 0: LLM parser (primary, if enabled)
+            # Шаг 0: LLM-парсер (основной, если включён)
             if settings.llm_parsing_enabled and settings.openai_api_key:
-                logger.info("Attempting LLM-based parsing...")
+                logger.info("Запуск LLM-парсинга...")
                 await _safe_edit(status_msg,"Анализирую документ с помощью ИИ...")
                 from services.llm_parser import parse_tz_with_llm
                 doc_text = _extract_text_from_docx(file_path)
@@ -232,41 +226,41 @@ async def handle_document(message: Message, bot: Bot) -> None:
                     requirements = await parse_tz_with_llm(doc_text)
                     if requirements and requirements.get("items"):
                         items = requirements.get("items", [])
-                        logger.info(f"✓ LLM parser succeeded: {len(items)} items extracted")
+                        logger.info(f"✓ LLM parser: {len(items)} позиций извлечено")
                         await _safe_edit(status_msg,
                             f"✓ ИИ извлёк требования\n"
                             f"Извлечено позиций: {len(items)}"
                         )
 
-            # Step 1: table-based parsing (fallback)
+            # Шаг 1: табличный парсер (резерв)
             if not requirements:
-                logger.info("Attempting table-based parsing...")
+                logger.info("Запуск табличного парсера...")
                 await _safe_edit(status_msg,"Анализирую структуру документа...")
                 requirements = parse_requirements_from_tables(file_path)
 
                 if requirements and requirements.get("items"):
                     items = requirements.get("items", [])
-                    logger.info(f"✓ Table parser succeeded: {len(items)} items extracted")
+                    logger.info(f"✓ Table parser: {len(items)} позиций извлечено")
                     await _safe_edit(status_msg,
                         f"✓ Обнаружена структурированная таблица\n"
                         f"Извлечено позиций: {len(items)}"
                     )
 
-            # Step 2: inline parser (last resort)
+            # Шаг 2: строчный парсер (последний вариант)
             if not requirements:
-                logger.info("Table parser found nothing, trying inline parser...")
+                logger.info("Таблица не найдена, запуск inline-парсера...")
                 await _safe_edit(status_msg,"Таблица не найдена, анализирую описания...")
                 requirements = parse_inline_descriptions(file_path)
 
                 if requirements and requirements.get("items"):
                     items = requirements.get("items", [])
-                    logger.info(f"✓ Inline parser succeeded: {len(items)} items extracted")
+                    logger.info(f"✓ Inline parser: {len(items)} позиций извлечено")
                     await _safe_edit(status_msg,
                         f"✓ Обнаружены описания оборудования\n"
                         f"Извлечено позиций: {len(items)}"
                     )
                 else:
-                    logger.info("All parsers failed — returning error to user")
+                    logger.info("Все парсеры не дали результата")
                     await _safe_edit(status_msg,
                         "Не удалось распознать структуру документа.\n\n"
                         "Бот поддерживает:\n"
@@ -277,7 +271,6 @@ async def handle_document(message: Message, bot: Bot) -> None:
                     )
                     return
 
-        # ── PDF path ──
         elif is_pdf:
             logger.info("Extracting text from PDF...")
             await _safe_edit(status_msg,"Извлекаю текст из PDF...")
@@ -305,7 +298,6 @@ async def handle_document(message: Message, bot: Bot) -> None:
             )
             return
 
-        # Summary of extracted items
         summary_lines = [f"Извлечено позиций оборудования: {len(items)}\n"]
         for i, item in enumerate(items, 1):
             name = item.get("item_name") or item.get("model_name") or "Без названия"
@@ -384,7 +376,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         except Exception as e:
             logger.error(f"Failed to save search history: {e}")
 
-        # Read file into memory before deletion so the upload doesn't depend on the temp file
+        # Читаем файл в память до удаления, чтобы загрузка не зависела от temp-файла
         excel_filename = os.path.basename(excel_path)
         with open(excel_path, "rb") as _f:
             excel_bytes = _f.read()

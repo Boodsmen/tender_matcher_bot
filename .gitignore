@@ -1,36 +1,90 @@
-# Environment
+# ===========================
+# Environment & Secrets
+# ===========================
 .env
+!.env.example
+README.md
 
+# ===========================
 # Python
+# ===========================
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.egg
 *.egg-info/
 dist/
 build/
+.eggs/
+pip-wheel-metadata/
 
-# Logs & temp
+# ===========================
+# Virtual Environments
+# ===========================
+.venv/
+venv/
+env/
+ENV/
+
+# ===========================
+# Logs & Temp
+# ===========================
 logs/
 temp_files/
+*.log
 
+# ===========================
 # IDE
+# ===========================
 .idea/
 .vscode/
 *.swp
 *.swo
+*.swn
+.history/
 
+# ===========================
+# Testing
+# ===========================
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# ===========================
 # Data artifacts
+# ===========================
 data/headers_report.json
 data/normalization_map.json
 
+# ===========================
 # Dev settings files (created by scripts/create_seting.py)
+# ===========================
 *_seting.py
 !scripts/create_seting.py
 
+# ===========================
 # OS
+# ===========================
 .DS_Store
 Thumbs.db
+desktop.ini
 
+# ===========================
 # Docker
+# ===========================
 postgres_data/
 
+# ===========================
+# Alembic
+# ===========================
+alembicversions/
+
+# ===========================
+# Misc
+# ===========================
 nul
+*.bak
+*.tmp

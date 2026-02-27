@@ -1,11 +1,10 @@
 """
-Requirements parsers for tender documents (DOCX).
+Парсеры требований из документов ТЗ (DOCX).
 
-Two parsers:
-1. parse_requirements_from_tables() — structured tables (5-column format)
-2. parse_inline_descriptions() — inline format "Характеристика: значение; ..."
+1. parse_requirements_from_tables() — структурированные таблицы (5-колоночный формат)
+2. parse_inline_descriptions() — строчный формат «Характеристика: значение; ...»
 
-Both return original characteristic names (no normalization to canonical keys).
+Оба возвращают оригинальные названия характеристик без нормализации к canonical_name.
 """
 
 import re
@@ -16,42 +15,35 @@ from docx import Document
 from utils.logger import logger
 
 
-# Составные условия вида "> 512 и ≤ 1024" — каждый токен с оператором и числом
+# Составное условие вида "> 512 и ≤ 1024": каждый токен — оператор + число
 _compound_re = re.compile(
     r'(?:[≥≤><≠=]+|>=|<=|!=|не\s+менее|не\s+более|до)\s*\d[\d,.]*',
     re.IGNORECASE,
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Value Parsing
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def parse_value(value_str: str, unit: str = "") -> Any:
     """
-    Parse a characteristic value from table cell.
-
-    Preserves comparison operators (≥, ≤, etc.) in the returned value string.
+    Разбор значения характеристики из ячейки таблицы.
+    Сохраняет операторы сравнения (≥, ≤ и т. д.) в возвращаемой строке.
     """
     if not value_str:
         return None
 
     value_str = value_str.replace('\xa0', ' ').strip()
 
-    # Boolean values
     if value_str.lower() in ["да", "yes", "истина", "true"]:
         return True
     if value_str.lower() in ["нет", "no", "ложь", "false"]:
         return False
 
-    # Compound condition: "> 512 и ≤ 1024" → list of conditions
+    # Составное условие: "> 512 и ≤ 1024" → список условий
     parts = _compound_re.findall(value_str)
     if len(parts) >= 2:
         parsed = [parse_value(p.strip()) for p in parts]
         return [p for p in parsed if p is not None]
 
-    # Operator detection
     operator_match = re.match(r'^([≥≤><≠]=?|>=|<=|!=)\s*', value_str)
     operator = None
     if operator_match:
@@ -68,19 +60,19 @@ def parse_value(value_str: str, unit: str = "") -> Any:
         elif re.match(r'до\s+', value_str, re.IGNORECASE):
             operator = "<="
 
-    # Strip operator prefix for numeric extraction
+    # Убираем префикс оператора перед извлечением числа
     value_for_numbers = re.sub(r'^[≥≤><≠=]+\s*', '', value_str)
     value_for_numbers = re.sub(
         r'^(?:не\s+менее|не\s+более|до)\s+', '', value_for_numbers, flags=re.IGNORECASE
     )
 
-    # Sum: "24+4" → 28
+    # Сложение: "24+4" → 28
     sum_match = re.match(r'^(\d+(?:\.\d+)?)\s*\+\s*(\d+(?:\.\d+)?)$', value_for_numbers.strip())
     if sum_match:
         num_val = float(sum_match.group(1)) + float(sum_match.group(2))
         return f"{operator}{num_val}" if operator else num_val
 
-    # Product: "24x4"
+    # Умножение: "24x4" → 96
     mult_match = re.match(r'^(\d+)\s*[xхX×]\s*(\d+)$', value_for_numbers.strip())
     if mult_match:
         num_val = int(mult_match.group(1)) * int(mult_match.group(2))
@@ -91,7 +83,7 @@ def parse_value(value_str: str, unit: str = "") -> Any:
         num_str = numbers[0].replace(',', '')
         try:
             num_val = int(num_str) if '.' not in num_str else float(num_str)
-            # Preserve trailing unit (e.g. "Гбит/с") so matcher can apply multipliers
+            # Сохраняем единицу измерения (например, "Гбит/с") — матчер применит множитель
             unit_in_str = re.search(
                 r'\b([a-zA-Zа-яА-Я/]+(?:/[a-zA-Zа-яА-Я]+)?)\s*$', value_for_numbers
             )
@@ -105,10 +97,6 @@ def parse_value(value_str: str, unit: str = "") -> Any:
 
     return value_str
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Column Detection
-# ═══════════════════════════════════════════════════════════════════════════
 
 _ITEM_NAME_PATTERNS = [
     r'наименование\s*(товара|оборудования|изделия|позиции)',
@@ -204,8 +192,6 @@ def _get_cell(cells: List[str], idx: Optional[int]) -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Equipment List Table
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def _extract_equipment_list(table) -> Dict[str, int]:
     if len(table.rows) < 2:
@@ -266,17 +252,9 @@ def _match_quantity(item_name: str, equipment_list: Dict[str, int]) -> Optional[
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Table Parsing (returns original characteristic names)
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def _parse_table_rows(table, col_map: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Parse all data rows from a characteristics table.
-
-    Returns rows with 'char_name' = original name from table (no normalization).
-    """
+    """Разбор строк таблицы характеристик. char_name — оригинальное название без нормализации."""
     header_rows: int = col_map.get("header_rows", 1)
     parsed_rows = []
 
@@ -303,11 +281,10 @@ def _parse_table_rows(table, col_map: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not char_name:
             continue
 
-        # Skip sub-header rows
+        # Пропускаем строки-подзаголовки внутри таблицы
         if _match_any_pattern(char_name, _CHAR_NAME_PATTERNS):
             continue
 
-        # Clean char_name: remove non-breaking spaces
         char_name = char_name.replace('\xa0', ' ').strip()
 
         value_with_unit = f"{value} {unit}".strip() if unit and unit.strip() else value
@@ -316,7 +293,7 @@ def _parse_table_rows(table, col_map: Dict[str, Any]) -> List[Dict[str, Any]]:
         parsed_rows.append({
             "item_name": item_name,
             "item_number": item_number,
-            "char_name": char_name,  # original name — no canonical key normalization
+            "char_name": char_name,
             "value": value,
             "unit": unit,
             "parsed_value": parsed_value,
@@ -344,11 +321,11 @@ def _group_requirements_by_item(rows: List[Dict[str, Any]]) -> Dict[str, List[Di
 
 
 def _extract_model_name_from_text(text: str) -> Optional[str]:
-    """Extract model name like 'MES2300DI-28' from 'MES2300DI-28 или эквивалент'."""
+    """Извлечь название модели типа 'MES2300DI-28' из строки 'MES2300DI-28 или эквивалент'."""
     m = re.match(r'^([A-Z][A-Z0-9][-A-Z0-9/.]+)', text.strip(), re.IGNORECASE)
     if m:
         name = m.group(1).strip()
-        if re.search(r'\d', name):  # must contain at least one digit
+        if re.search(r'\d', name):  # название должно содержать хотя бы одну цифру
             return name
     return None
 
@@ -364,7 +341,7 @@ def _build_item_dict(
     item_names = [r["item_name"] for r in requirements if r["item_name"]]
     item_name = item_names[0] if item_names else f"Позиция {item_prefix}"
 
-    # Infer category from item_name
+    # Определяем категорию по названию позиции
     category = None
     item_lower = item_name.lower()
     if "коммутатор" in item_lower or "switch" in item_lower:
@@ -372,16 +349,15 @@ def _build_item_dict(
     elif "маршрутизатор" in item_lower or "router" in item_lower or "шлюз" in item_lower:
         category = "Маршрутизаторы"
 
-    # Try to extract model_name from item_name (e.g. "MES2300DI-28 или эквивалент")
+    # Пробуем извлечь название модели из строки, например "MES2300DI-28 или эквивалент"
     model_name = _extract_model_name_from_text(item_name)
 
-    # Build required_specs with ORIGINAL characteristic names
     required_specs: Dict[str, Any] = {}
     for req in requirements:
         char_name = req["char_name"]
         parsed_value = req["parsed_value"]
         if parsed_value is not None and char_name:
-            if char_name not in required_specs:  # keep first occurrence
+            if char_name not in required_specs:  # берём первое вхождение
                 required_specs[char_name] = parsed_value
 
     quantity = _match_quantity(item_name, equipment_list)
@@ -395,25 +371,19 @@ def _build_item_dict(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main Table Parser
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def parse_requirements_from_tables(file_path: str) -> Optional[Dict[str, Any]]:
     """
-    Parse requirements from structured tables in a DOCX file.
-
-    Returns None if no suitable tables found.
-    required_specs uses ORIGINAL characteristic names (no canonical key normalization).
+    Разбор требований из структурированных таблиц DOCX.
+    Возвращает None, если подходящих таблиц не найдено.
     """
     try:
         doc = Document(file_path)
     except Exception as e:
-        logger.error(f"Failed to open DOCX: {e}")
+        logger.error(f"Не удалось открыть DOCX: {e}")
         return None
 
-    logger.info(f"Analyzing {len(doc.tables)} tables in document")
+    logger.info(f"Анализ {len(doc.tables)} таблиц документа")
 
     characteristics_tables: List[Tuple[int, Any, Dict]] = []
     equipment_list: Dict[str, int] = {}
@@ -421,29 +391,29 @@ def parse_requirements_from_tables(file_path: str) -> Optional[Dict[str, Any]]:
     for idx, table in enumerate(doc.tables):
         col_map = _detect_characteristics_columns(table)
         if col_map is not None:
-            logger.info(f"Found characteristics table at index {idx} ({len(table.rows)} rows)")
+            logger.info(f"Таблица характеристик: индекс {idx} ({len(table.rows)} строк)")
             characteristics_tables.append((idx, table, col_map))
         else:
             eq_list = _extract_equipment_list(table)
             if eq_list:
-                logger.info(f"Found equipment list table at index {idx} ({len(eq_list)} items)")
+                logger.info(f"Таблица перечня оборудования: индекс {idx} ({len(eq_list)} позиций)")
                 equipment_list.update(eq_list)
 
     if not characteristics_tables:
-        logger.info("No structured characteristics table found")
+        logger.info("Структурированная таблица характеристик не найдена")
         return None
 
     all_parsed_rows: List[Dict[str, Any]] = []
     for idx, table, col_map in characteristics_tables:
         rows = _parse_table_rows(table, col_map)
-        logger.info(f"Table {idx}: parsed {len(rows)} requirement rows")
+        logger.info(f"Таблица {idx}: разобрано {len(rows)} строк требований")
         all_parsed_rows.extend(rows)
 
     if not all_parsed_rows:
         return None
 
     groups = _group_requirements_by_item(all_parsed_rows)
-    logger.info(f"Grouped into {len(groups)} equipment items")
+    logger.info(f"Сгруппировано в {len(groups)} позиций оборудования")
 
     items = []
     for prefix in sorted(groups.keys(), key=lambda x: int(x) if x.isdigit() else 0):
@@ -453,23 +423,15 @@ def parse_requirements_from_tables(file_path: str) -> Optional[Dict[str, Any]]:
 
     result = {"items": items}
     logger.info(
-        f"Table parser extracted {len(items)} items, "
-        f"total specs: {sum(len(item['required_specs']) for item in items)}"
+        f"Table parser: {len(items)} позиций, "
+        f"всего характеристик: {sum(len(item['required_specs']) for item in items)}"
     )
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Inline Parser (for documents without structured tables)
-# ═══════════════════════════════════════════════════════════════════════════
-
 
 def _parse_inline_block(text: str) -> Dict[str, Any]:
-    """
-    Parse one semicolon-separated block: "Питание: 100–240 В; Кол-во портов: 28; ..."
-
-    Returns dict of {char_name: parsed_value}.
-    """
+    """Разбор блока, разделённого точкой с запятой: «Питание: 100–240 В; Кол-во: 28; ...»"""
     specs: Dict[str, Any] = {}
     for part in re.split(r';\s*', text):
         part = part.strip()
@@ -488,22 +450,14 @@ def _parse_inline_block(text: str) -> Dict[str, Any]:
 
 def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
     """
-    Parse inline format from a DOCX file.
-
-    Handles documents where each item is described as a series of
-    "Характеристика: значение" pairs, either:
-    - One per paragraph: "Питание: 100–240 В"
-    - Semicolon-separated in one paragraph: "Питание: 100–240 В; Кол-во: 28; ..."
-
-    Multiple items are separated by "Наименование товара:" paragraphs.
-
-    Returns:
-        Dict with 'items' list or None if nothing useful was found.
+    Разбор строчного формата из DOCX.
+    Поддерживает пары «Характеристика: значение» — по одной на строку или через «;».
+    Новые позиции разделяются абзацем «Наименование товара:».
     """
     try:
         doc = Document(file_path)
     except Exception as e:
-        logger.error(f"Failed to open DOCX for inline parsing: {e}")
+        logger.error(f"Не удалось открыть DOCX для inline-парсинга: {e}")
         return None
 
     items: List[Dict[str, Any]] = []
@@ -515,7 +469,7 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
     def _flush_item():
         nonlocal current_specs, current_item_name, current_model_name, current_category
         if current_specs:
-            # Infer category from item_name if not set
+            # Определяем категорию по названию, если не задана явно
             cat = current_category
             if cat is None and current_item_name:
                 il = current_item_name.lower()
@@ -536,7 +490,7 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
         current_model_name = None
         current_category = None
 
-    # Collect paragraphs and table cells
+    # Собираем текст из абзацев и ячеек таблиц
     text_lines: List[str] = []
     for para in doc.paragraphs:
         t = para.text.replace('\xa0', ' ').strip()
@@ -550,10 +504,8 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
                     text_lines.append(t)
 
     for line in text_lines:
-        # Check for "key: value" pattern
         m = re.match(r'^([^:]{2,60}):\s*(.+)$', line, re.DOTALL)
         if not m:
-            # Semicolon-separated inline block
             if ';' in line:
                 block_specs = _parse_inline_block(line)
                 current_specs.update(block_specs)
@@ -563,14 +515,14 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
         value_raw = m.group(2).strip()
         key_lower = key.lower()
 
-        # "Наименование товара" → start of new item
+        # «Наименование товара» — начало новой позиции
         if re.search(r'наименование\s*(товара|изделия|позиции|оборудования)', key_lower):
             _flush_item()
             current_item_name = value_raw
             current_model_name = _extract_model_name_from_text(value_raw)
             continue
 
-        # Category hints
+        # Определение категории
         if re.search(r'(категория|тип\s*устройства|тип\s*оборудования)', key_lower):
             vl = value_raw.lower()
             if "коммутатор" in vl or "switch" in vl:
@@ -579,18 +531,15 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
                 current_category = "Маршрутизаторы"
             continue
 
-        # Quantity — skip as spec
+        # Количество — не характеристика, пропускаем
         if re.search(r'количество\s*(единиц|шт\.?|штук)', key_lower):
             continue
 
-        # Regular characteristic
-        # Check for semicolons in value → might be multiple specs on one line
+        # Если в значении есть «;» — несколько характеристик на одной строке
         if ';' in value_raw:
-            # First, add current key-value
             parsed = parse_value(value_raw.split(';')[0])
             if parsed is not None:
                 current_specs[key] = parsed
-            # Then parse rest as inline block
             rest = ';'.join(value_raw.split(';')[1:])
             extra = _parse_inline_block(rest)
             current_specs.update(extra)
@@ -599,15 +548,14 @@ def parse_inline_descriptions(file_path: str) -> Optional[Dict[str, Any]]:
             if parsed is not None:
                 current_specs[key] = parsed
 
-    # Flush last item
     _flush_item()
 
     if not items:
-        logger.info("Inline parser: no items found")
+        logger.info("Inline parser: позиции не найдены")
         return None
 
     logger.info(
-        f"Inline parser: {len(items)} items, "
-        f"total specs: {sum(len(it['required_specs']) for it in items)}"
+        f"Inline parser: {len(items)} позиций, "
+        f"всего характеристик: {sum(len(it['required_specs']) for it in items)}"
     )
     return {"items": items}

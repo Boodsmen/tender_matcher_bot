@@ -9,9 +9,6 @@ from database.models import Equipment, EquipmentSpec, SearchHistory, User
 from utils.logger import logger
 
 
-# ──────────────────────────── Users ────────────────────────────
-
-
 async def get_user(telegram_id: int) -> Optional[User]:
     async with async_session_maker() as session:
         result = await session.execute(
@@ -40,9 +37,6 @@ async def create_user(
         return user
 
 
-# ──────────────────────────── Equipment ────────────────────────
-
-
 async def get_all_equipment() -> Sequence[Equipment]:
     async with async_session_maker() as session:
         result = await session.execute(select(Equipment))
@@ -58,7 +52,7 @@ async def get_equipment_by_category(category: str) -> Sequence[Equipment]:
 
 
 async def get_equipment_by_name(model_name: str) -> Sequence[Equipment]:
-    """Search equipment by model name. Exact matches come first, then substring matches."""
+    """Поиск оборудования по названию модели. Точные совпадения идут первыми."""
     async with async_session_maker() as session:
         result = await session.execute(
             select(Equipment)
@@ -80,7 +74,7 @@ async def get_equipment_count() -> int:
 
 
 async def get_stats() -> Dict[str, int]:
-    """Return count of equipment grouped by category."""
+    """Количество оборудования по категориям."""
     async with async_session_maker() as session:
         result = await session.execute(
             select(Equipment.category, func.count(Equipment.id))
@@ -91,7 +85,7 @@ async def get_stats() -> Dict[str, int]:
 
 
 async def bulk_create_equipment(items: List[Dict[str, Any]]) -> int:
-    """Bulk insert equipment into the database (without specs). Returns number of inserted rows."""
+    """Массовая вставка оборудования без характеристик. Возвращает число вставленных строк."""
     if not items:
         return 0
     async with async_session_maker() as session:
@@ -129,7 +123,7 @@ async def bulk_create_equipment_with_specs(records: List[Dict[str, Any]]) -> int
                 await session.flush()  # populate eq.id
 
                 for spec_row in specs_data:
-                    # Support both 3-tuple (legacy) and 4-tuple (with canonical_name)
+                    # Поддержка 3-кортежа (устаревший) и 4-кортежа (с canonical_name)
                     if len(spec_row) == 4:
                         char_name, value_text, value_num, canonical_name = spec_row
                     else:
@@ -150,12 +144,7 @@ async def bulk_create_equipment_with_specs(records: List[Dict[str, Any]]) -> int
 async def get_specs_by_equipment_ids(
     equipment_ids: List[int],
 ) -> Dict[int, List[EquipmentSpec]]:
-    """
-    Return all EquipmentSpec rows for the given equipment IDs, grouped by equipment_id.
-
-    Returns:
-        Dict mapping equipment_id -> list of EquipmentSpec objects.
-    """
+    """Вернуть все EquipmentSpec для указанных ID оборудования, сгруппированные по equipment_id."""
     if not equipment_ids:
         return {}
 
@@ -179,12 +168,9 @@ async def find_matching_equipment_by_canonical(
 ) -> set:
     """
     SQL: найти equipment_id, удовлетворяющие числовым требованиям по canonical_name.
-
     canonical_reqs: list of (canonical_name: str, num_val: float, op: str)
-    op: one of '>=', '<=', '>', '<', '='
-    Returns set of equipment_id.
     """
-    # Map operator strings to SQLAlchemy column operator functions (no f-string SQL injection)
+    # Операторы через lambda, без f-строк — защита от SQL injection
     _OP_FUNCS = {
         ">=": lambda col, val: col >= val,
         "<=": lambda col, val: col <= val,
@@ -214,7 +200,7 @@ async def find_matching_equipment_by_canonical(
 
 
 async def delete_all_equipment() -> int:
-    """Delete all equipment from the database (specs deleted via CASCADE). Returns row count."""
+    """Удалить всё оборудование из БД (характеристики удаляются по CASCADE). Возвращает число строк."""
     async with async_session_maker() as session:
         async with session.begin():
             result = await session.execute(text("DELETE FROM equipment"))
@@ -223,15 +209,12 @@ async def delete_all_equipment() -> int:
         return count
 
 
-# ──────────────────────────── Backward compat aliases ──────────
-
 
 async def get_models_count() -> int:
-    """Backward-compat alias for get_equipment_count()."""
+    """Псевдоним get_equipment_count() для обратной совместимости."""
     return await get_equipment_count()
 
 
-# ──────────────────────────── Search History ───────────────────
 
 
 async def save_search_history(

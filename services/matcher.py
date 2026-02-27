@@ -32,21 +32,13 @@ from database.models import Equipment, EquipmentSpec
 from utils.logger import logger
 
 
-# Mapping категорий к подкатегориям для расширенного поиска
 CATEGORY_SUBCATEGORIES: Dict[str, List[str]] = {
     "Коммутаторы": ["Управляемый", "Неуправляемый", "Промышленный"],
     "Маршрутизаторы": ["Универсальный шлюз безопасности", "Модульный"],
 }
 
-# Пороги fuzzy match
-CHAR_SIMILARITY_THRESHOLD = 0.6   # схожесть названий характеристик
-VALUE_TEXT_SIMILARITY_THRESHOLD = 0.7  # схожесть текстовых значений
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Извлечение чисел и операторов
-# ════════════════════════════════════════════════════════════════════════════
-
+CHAR_SIMILARITY_THRESHOLD = 0.6        # порог схожести названий характеристик
+VALUE_TEXT_SIMILARITY_THRESHOLD = 0.7  # порог схожести текстовых значений
 
 _UNIT_MULTIPLIERS = [
     (re.compile(r'тбит|tbps', re.IGNORECASE), 1_000_000),
@@ -59,7 +51,7 @@ _UNIT_MULTIPLIERS = [
     (re.compile(r'\bkb\b|\bкб\b', re.IGNORECASE), 0.001),
 ]
 
-# Matches individual operator+number tokens inside compound conditions like "> 32 и <= 64"
+# Отдельные токены «оператор+число» в составных условиях вида "> 32 и <= 64"
 _COMPOUND_RE = re.compile(
     r'(?:[≥≤><≠=]+|>=|<=|!=|не\s+менее|не\s+более|до)\s*[\d,.]+',
     re.IGNORECASE,
@@ -106,22 +98,21 @@ def extract_number(val) -> Optional[float]:
     if sum_match:
         return _apply_unit_multiplier(original, float(sum_match.group(1)) + float(sum_match.group(2)))
 
-    # Диапазоны: берём максимум
+    # Диапазон "10-20" → берём максимум
     range_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:-|до)\s*(\d+(?:\.\d+)?)', val_normalized)
     if range_match:
         return _apply_unit_multiplier(original, max(float(range_match.group(1)), float(range_match.group(2))))
 
-    # Умножение: "2x4"
+    # Умножение: "2x4" → 8
     mult_match = re.search(r'(\d+)\s*(?:[xхX×]|блок\w*\s+по)\s*(\d+)', val_normalized, re.IGNORECASE)
     if mult_match:
         return _apply_unit_multiplier(original, float(mult_match.group(1)) * float(mult_match.group(2)))
 
-    # Префиксы
+    # Текстовые префиксы: "до 1000", "не менее 500"
     prefix_match = re.search(r'(?:до|не\s+менее|минимум|максимум)\s+(\d+(?:\.\d+)?)', val_normalized, re.IGNORECASE)
     if prefix_match:
         return _apply_unit_multiplier(original, float(prefix_match.group(1)))
 
-    # Простое число
     match = re.search(r"[-+]?\d*\.?\d+", val_normalized)
     if match:
         return _apply_unit_multiplier(original, float(match.group()))
@@ -136,7 +127,7 @@ def extract_number_with_operator(val) -> Tuple[Optional[float], str]:
     Returns:
         Tuple (number, operator):
         - "≥ 24" → (24.0, ">=")
-        - "24" → (24.0, ">=")  (дефолт — модель должна >= требования)
+        - "24" → (24.0, ">=")  — по умолчанию модель должна быть не меньше требования
     """
     default_op = ">="
 
@@ -186,10 +177,6 @@ def extract_number_with_operator(val) -> Tuple[Optional[float], str]:
     return (number, op)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Текстовое сравнение
-# ════════════════════════════════════════════════════════════════════════════
-
 
 _YES_SYNONYMS = {'да', 'yes', 'есть', 'имеется', 'поддерживается', 'true', '1'}
 _NO_SYNONYMS = {'нет', 'no', 'отсутствует', 'не поддерживается', 'false', '0'}
@@ -228,8 +215,8 @@ def compare_text_values(required: str, model: str) -> bool:
         if req_parts & mod_parts:
             return True
 
-    # Guard: if strings contain digit-bearing tokens and they differ, don't fuzzy-match.
-    # Prevents false positives like "Layer 3" ≈ "Layer 2" or "Управляемый L3" ≈ "Управляемый".
+    # Если строки содержат токены с цифрами и они различаются — не применяем fuzzy.
+    # Защита от ложных совпадений: "Layer 3" ≈ "Layer 2", "Управляемый L3" ≈ "Управляемый".
     req_digit_tokens = set(re.findall(r'\b\w*\d\w*\b', req))
     mod_digit_tokens = set(re.findall(r'\b\w*\d\w*\b', mod))
     if req_digit_tokens != mod_digit_tokens:
@@ -242,16 +229,11 @@ def compare_text_values(required: str, model: str) -> bool:
     return False
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Compound condition helpers
-# ════════════════════════════════════════════════════════════════════════════
-
 
 def _parse_compound_conditions(text: str) -> Optional[List[Tuple[float, str]]]:
     """
-    Parse compound condition text like "> 32 и <= 64" into [(32.0, ">"), (64.0, "<=")].
-
-    Returns None if fewer than 2 operator+number tokens are found.
+    Разбор составного условия вида "> 32 и <= 64" → [(32.0, ">"), (64.0, "<=")].
+    Возвращает None, если найдено менее двух токенов оператор+число.
     """
     parts = _COMPOUND_RE.findall(text)
     if len(parts) < 2:
@@ -270,11 +252,9 @@ def _compound_conditions_compatible(
     allow_lower: bool,
 ) -> bool:
     """
-    Range containment check: DB range must be at least as wide as TZ requirement.
-
-    - '>' / '>=': DB lower bound <= TZ lower bound  (model covers more from below)
-    - '<' / '<=': DB upper bound >= TZ upper bound  (model covers more from above)
-    - '=': approximately equal
+    Проверка вхождения диапазона: диапазон из БД должен перекрывать диапазон из ТЗ.
+    '>' / '>=': нижняя граница БД ≤ нижней границе ТЗ.
+    '<' / '<=': верхняя граница БД ≥ верхней границе ТЗ.
     """
     def _is_lower(op: str) -> bool:
         return op in (">", ">=")
@@ -324,11 +304,10 @@ def compare_values_eav(
     - Числовые: математическое сравнение с оператором
     - Строковые: compare_text_values
     """
-    # Bug 2 fix: only bail out when both storage columns are empty
     if value_text is None and value_num is None:
         return False
 
-    # Bug 1 fix: compound conditions like "> 32 и <= 64"
+    # Составные условия ТЗ (список): "> 32 и <= 64"
     if isinstance(req_value, list):
         if value_text:
             db_conds = _parse_compound_conditions(value_text)
@@ -350,9 +329,9 @@ def compare_values_eav(
 
     req_num, op = extract_number_with_operator(req_value)
     model_num = extract_number(value_text) if value_text else value_num
-    # Bug 2 fix: compound DB value like ">=32 и <=64" — pick the appropriate bound.
-    # For >= / > (TZ needs at-least X): check DB's upper bound.
-    # For <= / < (TZ needs at-most X): check DB's lower bound.
+    # Составное значение в БД вида ">=32 и <=64": берём нужную границу.
+    # Для >= / > (ТЗ требует не менее X) — берём верхнюю границу БД.
+    # Для <= / < (ТЗ требует не более X) — берём нижнюю границу БД.
     if req_num is not None and value_text:
         db_conds = _parse_compound_conditions(value_text)
         if db_conds:
@@ -383,7 +362,7 @@ def _apply_operator(req_num: float, model_num: float, op: str, allow_lower: bool
     elif op == "<=":
         return model_num <= (req_num * 1.05 if allow_lower else req_num)
     elif op == "=":
-        # Use relative tolerance for large values, absolute for small ones
+        # Относительная погрешность для больших чисел, абсолютная для малых
         denom = max(abs(req_num), abs(model_num))
         if denom > 1:
             return abs(model_num - req_num) / denom < 0.001
@@ -400,10 +379,6 @@ def _apply_operator(req_num: float, model_num: float, op: str, allow_lower: bool
     else:
         return model_num >= req_num
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Fuzzy matching характеристик
-# ════════════════════════════════════════════════════════════════════════════
 
 
 def _char_similarity(a: str, b: str) -> float:
@@ -441,10 +416,6 @@ def find_best_char_match(
     return None
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Быстрое сопоставление: precomputed char_mapping
-# ════════════════════════════════════════════════════════════════════════════
-
 
 def _build_char_mapping(
     required_chars: List[str],
@@ -481,11 +452,10 @@ async def _build_char_mapping_llm(
     all_char_names: Set[str],
 ) -> Dict[str, str]:
     """
-    Semantic char mapping via OpenAI GPT-4o-mini.
-
-    Falls back to SequenceMatcher if key is missing or the API call fails.
-    Hallucination guard: only mappings where the suggested DB name actually
-    exists in all_char_names are accepted.
+    Семантическое сопоставление характеристик через OpenAI GPT-4o-mini.
+    При ошибке API или отключённом ключе падает на SequenceMatcher.
+    Защита от галлюцинаций: принимаются только маппинги, где предложенное
+    имя действительно присутствует в all_char_names.
     """
     if not settings.openai_api_key or not settings.llm_char_matching_enabled:
         return _build_char_mapping(required_chars, all_char_names)
@@ -570,26 +540,25 @@ def _match_one_model(
     total = len(required_specs)
     matched_count = 0
     matched_specs: List[str] = []
-    unmapped_specs: List[str] = []   # req_char found nowhere in DB (no fuzzy/canonical match globally)
-    missing_specs: List[str] = []    # req_char found in DB globally, but absent in this specific model
+    unmapped_specs: List[str] = []  # характеристика не найдена в БД вообще
+    missing_specs: List[str] = []   # характеристика есть в БД, но отсутствует у этой модели
     different_specs: Dict[str, tuple] = {}
     matched_values: Dict[str, str] = {}
 
     for req_char, req_value in required_specs.items():
-        # Skip the internal canonical map key
         if req_char == "__canonical__":
             total -= 1
             continue
 
         spec: Optional[EquipmentSpec] = None
 
-        # 1. Exact canonical lookup (from LLM parser)
+        # Шаг 1: точное совпадение по canonical_name (от LLM-парсера)
         if canonical_map and eq_canonical_dict:
             cname = canonical_map.get(req_char)
             if cname:
                 spec = eq_canonical_dict.get(cname)
 
-        # 2. Fuzzy fallback via precomputed char_mapping
+        # Шаг 2: нечёткий поиск через precomputed char_mapping
         globally_mapped = False
         if spec is None:
             db_char_name = char_mapping.get(req_char)
@@ -598,7 +567,6 @@ def _match_one_model(
                 spec = eq_specs_dict.get(db_char_name)
 
         if spec is None:
-            # Distinguish: known in DB (but not in this model) vs unknown in DB entirely
             if globally_mapped:
                 missing_specs.append(req_char)
             else:
@@ -639,41 +607,35 @@ def _run_matching_sync(
     precomputed_char_mapping: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    CPU-bound часть матчинга — запускается в executor чтобы не блокировать event loop.
-
-    candidates_data: [{id, model_name, category, version, source_filename}, ...]
-    precomputed_char_mapping: if provided (built async by LLM), skip SequenceMatcher step.
+    CPU-bound часть матчинга — запускается в executor, чтобы не блокировать event loop.
+    Если precomputed_char_mapping передан (собран LLM асинхронно), шаг SequenceMatcher пропускается.
     """
-    # Извлечь canonical_map из required_specs (добавляется LLM парсером)
     canonical_map: Optional[Dict[str, str]] = required_specs.get("__canonical__")
-    # Фильтруем __canonical__ из specs для матчинга
     effective_specs = {k: v for k, v in required_specs.items() if k != "__canonical__"}
 
-    # Шаг 1: собрать все уникальные char_names из всех кандидатов
     all_char_names: Set[str] = set()
     for specs in specs_by_id.values():
         for spec in specs:
             all_char_names.add(spec.char_name)
 
     logger.info(
-        f"Unique char_names in DB: {len(all_char_names)}, "
-        f"required: {len(effective_specs)}, candidates: {len(candidates_data)}, "
-        f"canonical_map: {len(canonical_map) if canonical_map else 0} entries"
+        f"Уникальных char_names в БД: {len(all_char_names)}, "
+        f"требуется: {len(effective_specs)}, кандидатов: {len(candidates_data)}, "
+        f"canonical_map: {len(canonical_map) if canonical_map else 0}"
     )
 
-    # Шаг 2: use precomputed LLM mapping if provided, else fall back to SequenceMatcher
     if precomputed_char_mapping is not None:
         char_mapping = precomputed_char_mapping
         logger.info(
-            f"Using precomputed LLM char mapping: "
-            f"{len(char_mapping)}/{len(effective_specs)} mapped"
+            f"Используется LLM char mapping: "
+            f"{len(char_mapping)}/{len(effective_specs)} сопоставлено"
         )
     else:
         t0 = time.time()
         char_mapping = _build_char_mapping(list(effective_specs.keys()), all_char_names)
         logger.info(
-            f"Char mapping (SequenceMatcher) computed in {time.time()-t0:.3f}s: "
-            f"{len(char_mapping)}/{len(effective_specs)} mapped"
+            f"Char mapping (SequenceMatcher) за {time.time()-t0:.3f}с: "
+            f"{len(char_mapping)}/{len(effective_specs)} сопоставлено"
         )
 
     # Шаг 3: для каждой модели — O(1) lookup
@@ -707,10 +669,6 @@ def _run_matching_sync(
     return matches
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Legacy: calculate_match_percentage_fuzzy (для совместимости)
-# ════════════════════════════════════════════════════════════════════════════
-
 
 def calculate_match_percentage_fuzzy(
     required_specs: Dict[str, Any],
@@ -729,10 +687,6 @@ def calculate_match_percentage_fuzzy(
     eq_specs_dict = {s.char_name: s for s in eq_specs}
     return _match_one_model(required_specs, eq_specs_dict, char_mapping, allow_lower)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Категоризация результатов
-# ════════════════════════════════════════════════════════════════════════════
 
 
 def categorize_matches(
@@ -757,15 +711,11 @@ def categorize_matches(
     not_matched.sort(key=lambda x: x["match_percentage"], reverse=True)
 
     logger.info(
-        f"Categorized: {len(ideal)} ideal, {len(partial)} partial, {len(not_matched)} not matched"
+        f"Категоризировано: {len(ideal)} идеальных, {len(partial)} частичных, {len(not_matched)} не совпало"
     )
 
     return {"ideal": ideal, "partial": partial, "not_matched": not_matched}
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Legacy: дедупликация (оставлена для совместимости с тестами)
-# ════════════════════════════════════════════════════════════════════════════
 
 
 def _parse_version_priority(source_file: str) -> float:
@@ -801,7 +751,7 @@ def deduplicate_models(models) -> list:
     non_empty = [m for m in models if _get_specs(m)]
     filtered_count = len(models) - len(non_empty)
     if filtered_count:
-        logger.info(f"Filtered out {filtered_count} models with empty specs")
+        logger.info(f"Отфильтровано {filtered_count} моделей без характеристик")
 
     groups: dict = defaultdict(list)
     for model in non_empty:
@@ -825,7 +775,6 @@ def deduplicate_models(models) -> list:
     return result
 
 
-# Legacy alias for backward compat
 def calculate_match_percentage(
     required_specs: Dict[str, Any],
     model_attrs: Dict[str, Any],
@@ -869,7 +818,7 @@ def calculate_match_percentage(
         "match_percentage": round(match_percentage, 2),
         "matched_specs": matched_specs,
         "unmapped_specs": unmapped_specs,
-        "missing_specs": list(unmapped_specs),  # separate list, same semantics in legacy path
+        "missing_specs": list(unmapped_specs),
         "different_specs": different_specs,
     }
 
@@ -898,13 +847,8 @@ def _compare_spec_values_legacy(
     return required_value == model_value
 
 
-# Backward compat alias — used by existing tests
 compare_spec_values = _compare_spec_values_legacy
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Основная функция поиска и сопоставления
-# ════════════════════════════════════════════════════════════════════════════
 
 
 async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
@@ -930,7 +874,7 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
     """
     items = requirements.get("items", [])
     if not items:
-        logger.warning("No items in requirements")
+        logger.warning("Список позиций в требованиях пуст")
         return {
             "results": [],
             "summary": {
@@ -949,7 +893,7 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
     threshold = settings.match_threshold
     allow_lower = settings.allow_lower_values
 
-    logger.info(f"Starting matching: threshold={threshold}%, allow_lower={allow_lower}")
+    logger.info(f"Начало матчинга: порог={threshold}%, allow_lower={allow_lower}")
 
     for idx, item in enumerate(items, 1):
         model_name = item.get("model_name")
@@ -961,13 +905,12 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
             f"category={category}, specs={len(required_specs)}"
         )
 
-        # ── Поиск кандидатов ──
         candidates = []
         search_start = time.time()
 
         if model_name:
             candidates = list(await get_equipment_by_name(model_name))
-            logger.info(f"Found {len(candidates)} by name in {time.time()-search_start:.3f}s")
+            logger.info(f"По названию найдено {len(candidates)} за {time.time()-search_start:.3f}с")
 
         elif category:
             candidates = list(await get_equipment_by_category(category))
@@ -978,14 +921,14 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
                     sub_models = await get_equipment_by_category(sub)
                     candidates.extend(sub_models)
                 logger.info(
-                    f"Found {len(candidates)} (base {initial_count} + subcategories "
-                    f"{len(candidates)-initial_count}) in {time.time()-search_start:.3f}s"
+                    f"Найдено {len(candidates)} (основных {initial_count} + подкатегории "
+                    f"{len(candidates)-initial_count}) за {time.time()-search_start:.3f}с"
                 )
             else:
-                logger.info(f"Found {len(candidates)} in {time.time()-search_start:.3f}s")
+                logger.info(f"Найдено {len(candidates)} за {time.time()-search_start:.3f}с")
 
         else:
-            logger.warning(f"[Req {idx}] category=None and model_name=None — skipping")
+            logger.warning(f"[Поз. {idx}] category=None и model_name=None — пропуск")
             results.append({
                 "requirement": item,
                 "matches": {"ideal": [], "partial": [], "not_matched": []},
@@ -993,15 +936,14 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
             })
             continue
 
-        # ── Загружаем EAV спецификации для всех кандидатов одним запросом ──
+        # Загружаем EAV-характеристики всех кандидатов одним запросом
         candidate_ids = [eq.id for eq in candidates]
         specs_by_id = await get_specs_by_equipment_ids(candidate_ids)
         logger.info(
-            f"Loaded specs for {len(specs_by_id)} candidates "
-            f"(total spec rows: {sum(len(v) for v in specs_by_id.values())})"
+            f"Загружены спецификации для {len(specs_by_id)} кандидатов "
+            f"(всего строк: {sum(len(v) for v in specs_by_id.values())})"
         )
 
-        # ── Сопоставление: precomputed char_mapping + executor (не блокирует event loop) ──
         candidates_data = [
             {
                 "model_id": eq.id,
@@ -1013,7 +955,7 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
             for eq in candidates
         ]
 
-        # Build all_char_names here so the async LLM call can use them
+        # Собираем все char_names для LLM-маппинга до запуска executor
         all_char_names_for_llm: Set[str] = set()
         for specs_list in specs_by_id.values():
             for spec in specs_list:
@@ -1037,9 +979,8 @@ async def find_matching_models(requirements: Dict[str, Any]) -> Dict[str, Any]:
                 precomputed_char_mapping=char_mapping,
             ),
         )
-        logger.info(f"Matching {len(candidates)} candidates done in {time.time()-match_start:.3f}s")
+        logger.info(f"Матчинг {len(candidates)} кандидатов выполнен за {time.time()-match_start:.3f}с")
 
-        # ── Категоризация ──
         categorized = categorize_matches(matches, threshold)
         results.append({"requirement": item, "matches": categorized})
 
